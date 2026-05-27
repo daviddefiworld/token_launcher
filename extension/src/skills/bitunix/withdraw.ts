@@ -1,6 +1,7 @@
 import type { AutomationResponse, FillableElement, TokenAutomationMessage } from '../../types';
 import {
   clickElement,
+  delay,
   elementText,
   enabled,
   findButtonByText,
@@ -8,13 +9,17 @@ import {
   normalize,
   retryStep,
   setFieldValue,
+  stepDelay,
+  successResponse,
   typeFieldValue,
-  visibleElements
-} from '../shared/dom';
-import { delay, stepDelay, waitFor } from '../shared/timing';
-import { successResponse } from '../shared/response';
-import { writeStatus } from '../shared/status';
-import { BITUNIX_HOST, WAIT, WITHDRAW_PATH } from './constants';
+  visibleElements,
+  waitFor,
+  writeStatus
+} from '../dom';
+
+export const BITUNIX_HOST = 'www.bitunix.com';
+export const WITHDRAW_PATH = '/assets/withdraw';
+export const WAIT = { short: 20000, medium: 60000, long: 120000, poll: 500 } as const;
 
 function findSymbolSelectWrapper(): HTMLElement | null {
   return visibleElements<HTMLElement>('.symbol-select-wrapper')[0] || null;

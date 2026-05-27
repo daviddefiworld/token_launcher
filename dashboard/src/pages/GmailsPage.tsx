@@ -11,25 +11,7 @@ import {
   syncGmailAccounts
 } from '../api';
 import type { CachedGmailMessage, GmailAccount } from '../types';
-
-function formatRelativeTime(value: string | undefined): string {
-  if (!value) return 'never';
-  const time = new Date(value).getTime();
-  if (!Number.isFinite(time)) return 'unknown';
-  const seconds = Math.max(1, Math.round((Date.now() - time) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  return `${hours}h ago`;
-}
-
-function formatUtcTime(value: string | undefined): string {
-  if (!value) return 'unknown';
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return 'unknown';
-  return date.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
-}
+import { formatRelativeTime, formatUtcTime } from '../utils';
 
 export function GmailsPage() {
   const [searchParams, setSearchParams] = useSearchParams();

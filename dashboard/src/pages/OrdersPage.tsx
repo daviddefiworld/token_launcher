@@ -1,18 +1,7 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { getActivity } from '../api';
 import type { ActivityItem } from '../types';
-
-function formatUtcTime(value: string | undefined): string {
-  if (!value) return 'unknown';
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return 'unknown';
-  return date.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
-}
-
-function shortId(id: string): string {
-  return id.length > 20 ? `${id.slice(0, 18)}…` : id;
-}
+import { formatDuration, formatUtcTime, shortId } from '../utils';
 
 function kindLabel(kind: ActivityItem['kind']): string {
   return kind === 'email_verification' ? 'Email check' : 'Withdraw';
@@ -23,16 +12,6 @@ function statusClass(status: string): string {
   if (status === 'failed') return 'pill danger';
   if (status === 'executing' || status === 'pending') return 'pill muted';
   return 'pill';
-}
-
-function formatDuration(ms: number | undefined): string | null {
-  if (ms === undefined || !Number.isFinite(ms)) return null;
-  if (ms < 1000) return `${ms}ms`;
-  const seconds = ms / 1000;
-  if (seconds < 60) return `${seconds.toFixed(1)}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainder = Math.round(seconds % 60);
-  return `${minutes}m ${remainder}s`;
 }
 
 export function OrdersPage({

@@ -1,6 +1,6 @@
 import type { AutomationResponse, TokenAutomationMessage } from './types';
 import { runWithdraw, submitVerification } from './skills/bitunix';
-import { writeStatus } from './skills/shared/status';
+import { writeStatus } from './skills/dom';
 
 const globalWindow = window as typeof window & {
   __tokenAutomationContentLoaded?: boolean;

@@ -1,5 +1,61 @@
-import type { FillableElement } from '../../types';
-import { delay, stepDelay, waitFor } from './timing';
+import type { AutomationResponse, FillableElement } from '../types';
+
+export const POLL_INTERVAL_MS = 500;
+
+export function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+export function stepDelay(): Promise<void> {
+  return delay(1000 + Math.floor(Math.random() * 2000));
+}
+
+export async function waitFor<T>(
+  factory: () => T | null | undefined | false,
+  timeoutMs: number,
+  intervalMs: number = POLL_INTERVAL_MS
+): Promise<T> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const value = factory();
+    if (value) return value;
+    await delay(intervalMs);
+  }
+  throw new Error('Timed out waiting for page state');
+}
+
+export function successResponse(message: string): AutomationResponse {
+  return {
+    success: true,
+    message,
+    pageUrl: window.location.href,
+    pageTitle: document.title,
+    completedAt: new Date().toISOString()
+  };
+}
+
+export function writeStatus(text: string): void {
+  const existing = document.getElementById('token-automation-order-done');
+  const banner = existing ?? document.createElement('div');
+  banner.id = 'token-automation-order-done';
+  banner.textContent = text;
+  banner.setAttribute(
+    'style',
+    [
+      'position: fixed',
+      'right: 20px',
+      'bottom: 20px',
+      'z-index: 2147483647',
+      'padding: 14px 18px',
+      'border-radius: 12px',
+      'background: #16a34a',
+      'color: #ffffff',
+      'font: 700 16px/1.3 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      'box-shadow: 0 16px 40px rgba(15, 23, 42, 0.24)'
+    ].join(';')
+  );
+  if (!existing) document.documentElement.appendChild(banner);
+}
 
 export function visible(element: Element): element is HTMLElement {
   if (!(element instanceof HTMLElement)) return false;
@@ -43,17 +99,12 @@ function setNativeValue(element: FillableElement, value: string): void {
   const prototype =
     element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
-  if (descriptor?.set) {
-    descriptor.set.call(element, value);
-  } else {
-    element.value = value;
-  }
+  if (descriptor?.set) descriptor.set.call(element, value);
+  else element.value = value;
 }
 
 function dispatchFieldEvents(element: FillableElement, value: string, inputType: string, data?: string): void {
-  element.dispatchEvent(
-    new InputEvent('input', { bubbles: true, composed: true, inputType, data: data ?? value })
-  );
+  element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType, data: data ?? value }));
   element.dispatchEvent(new Event('change', { bubbles: true }));
   element.closest('.arco-input-wrapper, .arco-textarea-wrapper')?.dispatchEvent(new Event('input', { bubbles: true }));
 }
@@ -62,15 +113,12 @@ export function setFieldValue(element: FillableElement, value: string, options?:
   element.focus();
   setNativeValue(element, value);
   dispatchFieldEvents(element, value, 'insertFromPaste');
-  if (options?.blur !== false) {
-    element.blur();
-  }
+  if (options?.blur !== false) element.blur();
 }
 
 export function typeFieldValue(element: FillableElement, value: string): void {
   element.focus();
   setFieldValue(element, '', { blur: false });
-
   for (const character of value) {
     element.dispatchEvent(new KeyboardEvent('keydown', { key: character, bubbles: true }));
     const nextValue = element.value + character;
@@ -78,19 +126,7 @@ export function typeFieldValue(element: FillableElement, value: string): void {
     dispatchFieldEvents(element, nextValue, 'insertText', character);
     element.dispatchEvent(new KeyboardEvent('keyup', { key: character, bubbles: true }));
   }
-
   element.blur();
-}
-
-export function setEditableValue(element: HTMLElement, value: string): void {
-  if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-    setFieldValue(element, value);
-    return;
-  }
-  element.focus();
-  element.textContent = value;
-  element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-  element.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 export function findButtonByText(terms: string[], root: ParentNode = document): HTMLElement | null {
@@ -111,7 +147,12 @@ export async function clickButton(terms: string[], timeoutMs: number): Promise<b
   return true;
 }
 
-export async function retryStep<T>(label: string, action: () => Promise<T>, writeStatusFn: (text: string) => void, attempts = 4): Promise<T> {
+export async function retryStep<T>(
+  label: string,
+  action: () => Promise<T>,
+  writeStatusFn: (text: string) => void,
+  attempts = 4
+): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {

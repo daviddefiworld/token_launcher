@@ -3,7 +3,8 @@ import { io, Socket } from 'socket.io-client';
 const DEFAULT_BACKEND_URL = 'http://localhost:5050';
 const BITUNIX_WITHDRAW_URL = 'https://www.bitunix.com/assets/withdraw';
 const BITUNIX_WALLET_URL = 'https://www.bitunix.com/assets/overview';
-const POST_SUCCESS_WALLET_DELAY_MS = 50_000;
+const POST_SUCCESS_WALLET_DELAY_MS = 30_000;
+const ORDER_TIMEOUT_MS = 5 * 60 * 1000;
 const SLOW_PAGE_TIMEOUT_MS = 120000;
 const EMAIL_CODE_WAIT_TIMEOUT_MS = 190000;
 const STORAGE_KEYS = {
@@ -41,6 +42,7 @@ interface ContentPingResponse {
 
 let socket: Socket | null = null;
 let extensionId = '';
+let runningOrderId: string | null = null;
 
 const backendInput = document.getElementById('backend-url') as HTMLInputElement;
 const saveButton = document.getElementById('save-backend') as HTMLButtonElement;
@@ -366,6 +368,54 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        window.clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+async function executeWithdrawOrder(
+  payload: RunOrderPayload,
+  setBitunixTabId: (tabId: number) => void
+): Promise<ContentOrderResponse> {
+  const tab = await getActiveTab();
+  const withdrawTab = await ensureWithdrawTab(tab);
+  const tabId = await ensureContentScript(withdrawTab);
+  setBitunixTabId(tabId);
+  let result = await sendToContent(tabId, 'tokenAutomationOrder', payload);
+
+  if (result.verificationRequired) {
+    const emailCodeSentAt = result.emailCodeSentAt || Date.now();
+    const emailCode = await resolveEmailCode(payload.orderId, emailCodeSentAt, payload.emailCode || result.emailCode);
+    const authenticatorCode = await readAuthenticatorCode(payload.authenticatorCode);
+
+    showVerificationCodes(emailCode, authenticatorCode);
+    setMessage('Codes received. Filling Bitunix verification modal...');
+
+    await updateTab(tabId, { active: true });
+    await waitForTabComplete(tabId).catch(() => undefined);
+    await ensureContentScript(await getTab(tabId));
+
+    result = await sendToContent(tabId, 'tokenAutomationCompleteVerification', {
+      ...payload,
+      emailCode,
+      authenticatorCode
+    });
+  }
+
+  return result;
+}
+
 async function moveToBitunixWallet(tabId?: number, statusMessage = 'Opening Bitunix wallet...'): Promise<void> {
   try {
     const tab = tabId !== undefined ? await getTab(tabId) : await getActiveTab();
@@ -387,37 +437,21 @@ async function runOrder(payload: RunOrderPayload): Promise<void> {
   let bitunixTabId: number | undefined;
 
   try {
-    const tab = await getActiveTab();
-    const withdrawTab = await ensureWithdrawTab(tab);
-    const tabId = await ensureContentScript(withdrawTab);
-    bitunixTabId = tabId;
-    let result = await sendToContent(tabId, 'tokenAutomationOrder', payload);
-
-    if (result.verificationRequired) {
-      const emailCodeSentAt = result.emailCodeSentAt || Date.now();
-      const emailCode = await resolveEmailCode(payload.orderId, emailCodeSentAt, payload.emailCode || result.emailCode);
-      const authenticatorCode = await readAuthenticatorCode(payload.authenticatorCode);
-
-      showVerificationCodes(emailCode, authenticatorCode);
-      setMessage('Codes received. Filling Bitunix verification modal...');
-
-      await updateTab(tabId, { active: true });
-      await waitForTabComplete(tabId).catch(() => undefined);
-      await ensureContentScript(await getTab(tabId));
-
-      result = await sendToContent(tabId, 'tokenAutomationCompleteVerification', {
-        ...payload,
-        emailCode,
-        authenticatorCode
-      });
-    }
+    const result = await withTimeout(
+      executeWithdrawOrder(payload, (tabId) => {
+        bitunixTabId = tabId;
+      }),
+      ORDER_TIMEOUT_MS,
+      'Order timed out after 5 minutes'
+    );
 
     socket?.emit('extension:order_result', {
       orderId: payload.orderId,
       status: 'completed',
       output: result
     });
-    setMessage('Withdraw complete. Waiting 20s before opening wallet...');
+
+    setMessage('Withdraw complete. Waiting before opening wallet...');
     await delay(POST_SUCCESS_WALLET_DELAY_MS);
     await moveToBitunixWallet(bitunixTabId, 'Opening Bitunix wallet...');
   } catch (error) {
@@ -481,7 +515,19 @@ async function connect(): Promise<void> {
   });
 
   socket.on('extension:run_order', (payload: RunOrderPayload) => {
-    void runOrder(payload);
+    if (runningOrderId) {
+      socket?.emit('extension:order_result', {
+        orderId: payload.orderId,
+        status: 'failed',
+        error: 'Extension is already running an order'
+      });
+      return;
+    }
+
+    runningOrderId = payload.orderId;
+    void runOrder(payload).finally(() => {
+      if (runningOrderId === payload.orderId) runningOrderId = null;
+    });
   });
 }
 

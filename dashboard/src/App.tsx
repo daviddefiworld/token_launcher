@@ -6,21 +6,16 @@ import { OrdersPage } from './pages/OrdersPage';
 import { io, Socket } from 'socket.io-client';
 import { createOrder, getActivity, getBackendUrl, getExtensions, getOrders, type WithdrawOrderInput } from './api';
 import type { ActivityItem, AutomationOrder, ExtensionRecord, VerificationCodeRequest } from './types';
-
-function formatRelativeTime(value: string): string {
-  const time = new Date(value).getTime();
-  if (!Number.isFinite(time)) return 'unknown';
-  const seconds = Math.max(1, Math.round((Date.now() - time) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  return `${hours}h ago`;
-}
-
-function shortId(extensionId: string): string {
-  return extensionId.length > 20 ? `${extensionId.slice(0, 18)}...` : extensionId;
-}
+import {
+  ActivityMapper,
+  formatDuration,
+  formatRelativeTime,
+  formatUtcTime,
+  orderCompletedAt,
+  orderStatusClass,
+  shortId,
+  upsertById
+} from './utils';
 
 const DEFAULT_WITHDRAW_INPUT: WithdrawOrderInput = {
   currency: 'ETH',
@@ -28,69 +23,6 @@ const DEFAULT_WITHDRAW_INPUT: WithdrawOrderInput = {
   address: '0xF79a17Ab4857Bd6D64d3309AC6dF4Cf522B7bF45',
   amount: '0.001'
 };
-
-function upsertOrder(orders: AutomationOrder[], order: AutomationOrder): AutomationOrder[] {
-  const existing = orders.findIndex((item) => item.orderId === order.orderId);
-  if (existing === -1) {
-    return [order, ...orders];
-  }
-  const next = [...orders];
-  next[existing] = order;
-  return next.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-}
-
-function upsertActivityItem(items: ActivityItem[], item: ActivityItem): ActivityItem[] {
-  const index = items.findIndex((entry) => entry.id === item.id && entry.kind === item.kind);
-  if (index === -1) {
-    return [item, ...items].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  }
-  const next = [...items];
-  next[index] = item;
-  return next.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-}
-
-function verificationToActivity(request: VerificationCodeRequest): ActivityItem {
-  const sentLabel = new Date(request.emailCodeSentAt).toISOString();
-  return {
-    id: request.requestId,
-    kind: 'email_verification',
-    extensionId: request.extensionId,
-    status: request.status,
-    title: 'Gmail verification code',
-    summary: `Withdraw order ${request.orderId.slice(0, 8)}… · after ${sentLabel}`,
-    parentOrderId: request.orderId,
-    emailCode: request.emailCode,
-    emailCodeSentAt: request.emailCodeSentAt,
-    error: request.error,
-    message: request.status === 'completed' ? `Code ${request.emailCode}` : undefined,
-    createdAt: request.createdAt,
-    updatedAt: request.updatedAt
-  };
-}
-
-function withdrawToActivity(order: AutomationOrder): ActivityItem {
-  return {
-    id: order.orderId,
-    kind: 'withdraw',
-    extensionId: order.extensionId,
-    status: order.status,
-    title: order.input.text,
-    summary: `${order.input.amount} ${order.input.currency} on ${order.input.chain} → ${order.input.address}`,
-    withdraw: {
-      currency: order.input.currency,
-      chain: order.input.chain,
-      address: order.input.address,
-      amount: order.input.amount,
-      text: order.input.text
-    },
-    error: order.error,
-    message: order.output?.message,
-    pageUrl: order.output?.pageUrl,
-    executeTimeMs: order.executeTimeMs,
-    createdAt: order.createdAt,
-    updatedAt: order.updatedAt
-  };
-}
 
 function Header({ connected }: { connected: boolean }) {
   return (
@@ -161,30 +93,38 @@ function ExtensionsPage({
 }
 
 function OrderList({ orders }: { orders: AutomationOrder[] }) {
+  const recentOrders = orders.slice(0, 3);
+
   if (orders.length === 0) {
     return <div className="empty small">No orders sent to this extension yet.</div>;
   }
 
   return (
-    <div className="order-list">
-      {orders.map((order) => (
-        <article key={order.orderId} className="order-card">
-          <div className="card-title-row">
-            <strong>{order.input.text}</strong>
-            <span className={`pill ${order.status === 'completed' ? 'success' : order.status === 'failed' ? 'danger' : ''}`}>
-              {order.status}
-            </span>
-          </div>
-          <p className="subtle order-summary">
-            {order.input.amount} {order.input.currency} on {order.input.chain} to {order.input.address}
-          </p>
-          <p className="mono">{order.orderId}</p>
-          {order.output?.pageUrl && <p className="url-line">{order.output.pageUrl}</p>}
-          {order.output?.message && <p className="result">{order.output.message}</p>}
-          {order.error && <p className="error">{order.error}</p>}
-        </article>
-      ))}
-    </div>
+    <>
+      <div className="order-list">
+        {recentOrders.map((order) => (
+          <article key={order.orderId} className="order-card">
+            <div className="card-title-row">
+              <strong>{order.input.text}</strong>
+              <span className={orderStatusClass(order.status)}>{order.status}</span>
+            </div>
+            <p className="subtle order-summary">
+              {order.input.amount} {order.input.currency} on {order.input.chain} to {order.input.address}
+            </p>
+            {order.executeTimeMs !== undefined && (
+              <p className="subtle mono">Execute time {formatDuration(order.executeTimeMs)}</p>
+            )}
+            {order.output?.message && <p className="result">{order.output.message}</p>}
+            {order.error && <p className="error">{order.error}</p>}
+          </article>
+        ))}
+      </div>
+      {orders.length > 3 && (
+        <p className="subtle" style={{ marginTop: 12 }}>
+          Showing latest 3 orders. <Link to="/orders">View all orders</Link>
+        </p>
+      )}
+    </>
   );
 }
 
@@ -201,6 +141,7 @@ function ExtensionDetailPage({
   const extensionId = rawExtensionId ? decodeURIComponent(rawExtensionId) : '';
   const extension = extensions.find((item) => item.extensionId === extensionId);
   const extensionOrders = orders.filter((order) => order.extensionId === extensionId);
+  const hasActiveOrders = extensionOrders.some((order) => order.status === 'pending' || order.status === 'executing');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [withdrawInput, setWithdrawInput] = useState<WithdrawOrderInput>(DEFAULT_WITHDRAW_INPUT);
@@ -208,6 +149,14 @@ function ExtensionDetailPage({
   const updateWithdrawInput = (field: keyof WithdrawOrderInput, value: string) => {
     setWithdrawInput((current) => ({ ...current, [field]: value }));
   };
+
+  useEffect(() => {
+    if (!hasActiveOrders) return;
+    const timer = window.setInterval(() => {
+      void reloadOrders(extensionId);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [extensionId, hasActiveOrders, reloadOrders]);
 
   const sendOrder = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -280,11 +229,20 @@ function ExtensionDetailPage({
           <button
             type="submit"
             className="button"
-            disabled={!extension || sending || !withdrawInput.address.trim() || !withdrawInput.amount.trim()}
+            disabled={
+              !extension ||
+              sending ||
+              hasActiveOrders ||
+              !withdrawInput.address.trim() ||
+              !withdrawInput.amount.trim()
+            }
           >
-            {sending ? 'Sending...' : 'Send withdraw order'}
+            {sending ? 'Sending...' : hasActiveOrders ? 'Order in progress...' : 'Send withdraw order'}
           </button>
         </form>
+        {hasActiveOrders && (
+          <p className="subtle">This extension is running an order. Wait for it to finish before sending another.</p>
+        )}
         <p className="subtle">
           The extension opens Bitunix withdraw, submits the form, waits for the email code from the backend Gmail service,
           and fills Google Authenticator automatically unless you provide codes here. Connect Gmail accounts on the Gmails tab.
@@ -353,18 +311,36 @@ function App() {
       setLoading(false);
     });
     socket.on('orders:created', (data: { order: AutomationOrder }) => {
-      setOrders((current) => upsertOrder(current, data.order));
-      setActivity((current) => upsertActivityItem(current, withdrawToActivity(data.order)));
+      setOrders((current) => upsertById(current, data.order, (o) => o.orderId, data.order.orderId));
+      setActivity((current) =>
+        upsertById(current, ActivityMapper.fromOrder(data.order), (i) => `${i.kind}:${i.id}`, `withdraw:${data.order.orderId}`)
+      );
     });
     socket.on('orders:updated', (data: { order: AutomationOrder }) => {
-      setOrders((current) => upsertOrder(current, data.order));
-      setActivity((current) => upsertActivityItem(current, withdrawToActivity(data.order)));
+      setOrders((current) => upsertById(current, data.order, (o) => o.orderId, data.order.orderId));
+      setActivity((current) =>
+        upsertById(current, ActivityMapper.fromOrder(data.order), (i) => `${i.kind}:${i.id}`, `withdraw:${data.order.orderId}`)
+      );
     });
     socket.on('verification-requests:created', (data: { request: VerificationCodeRequest }) => {
-      setActivity((current) => upsertActivityItem(current, verificationToActivity(data.request)));
+      setActivity((current) =>
+        upsertById(
+          current,
+          ActivityMapper.fromVerification(data.request),
+          (i) => `${i.kind}:${i.id}`,
+          `email_verification:${data.request.requestId}`
+        )
+      );
     });
     socket.on('verification-requests:updated', (data: { request: VerificationCodeRequest }) => {
-      setActivity((current) => upsertActivityItem(current, verificationToActivity(data.request)));
+      setActivity((current) =>
+        upsertById(
+          current,
+          ActivityMapper.fromVerification(data.request),
+          (i) => `${i.kind}:${i.id}`,
+          `email_verification:${data.request.requestId}`
+        )
+      );
     });
 
     void reloadExtensions();
