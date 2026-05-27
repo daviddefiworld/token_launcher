@@ -1,0 +1,14 @@
+{
+  "name": "token-automation",
+  "private": true,
+  "version": "0.1.0",
+  "description": "No-auth token automation demo with backend, dashboard, and browser extension.",
+  "scripts": {
+    "backend:dev": "npm --prefix backend run dev",
+    "backend:build": "npm --prefix backend run build",
+    "dashboard:dev": "npm --prefix dashboard run dev",
+    "dashboard:build": "npm --prefix dashboard run build",
+    "extension:dev": "npm --prefix extension run dev",
+    "extension:build": "npm --prefix extension run build"
+  }
+}

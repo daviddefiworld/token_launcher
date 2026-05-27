@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Token Automation Extension",
+  "version": "0.1.0",
+  "description": "Receives token automation orders and runs Bitunix withdraw automation.",
+  "permissions": ["activeTab", "storage", "tabs", "sidePanel", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_title": "Token Automation"
+  },
+  "side_panel": {
+    "default_path": "sidebar.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
