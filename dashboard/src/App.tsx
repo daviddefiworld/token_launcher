@@ -14,7 +14,9 @@ import {
   orderCompletedAt,
   orderStatusClass,
   shortId,
-  upsertById
+  upsertById,
+  waitForExtensionIdle,
+  waitForOrderCompleted
 } from './utils';
 
 const DEFAULT_WITHDRAW_INPUT: WithdrawOrderInput = {
@@ -143,6 +145,8 @@ function ExtensionDetailPage({
   const extensionOrders = orders.filter((order) => order.extensionId === extensionId);
   const hasActiveOrders = extensionOrders.some((order) => order.status === 'pending' || order.status === 'executing');
   const [sending, setSending] = useState(false);
+  const [repeat, setRepeat] = useState(1);
+  const [repeatProgress, setRepeatProgress] = useState<{ current: number; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [withdrawInput, setWithdrawInput] = useState<WithdrawOrderInput>(DEFAULT_WITHDRAW_INPUT);
 
@@ -160,15 +164,24 @@ function ExtensionDetailPage({
 
   const sendOrder = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const total = Math.max(1, Math.floor(Number(repeat) || 1));
     setSending(true);
     setError(null);
+    setRepeatProgress(null);
     try {
-      await createOrder(extensionId, withdrawInput);
-      await reloadOrders(extensionId);
+      for (let index = 0; index < total; index += 1) {
+        await waitForExtensionIdle(extensionId);
+        setRepeatProgress({ current: index + 1, total });
+        const order = await createOrder(extensionId, withdrawInput);
+        await reloadOrders(extensionId);
+        await waitForOrderCompleted(extensionId, order.orderId);
+        await reloadOrders(extensionId);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to send order');
     } finally {
       setSending(false);
+      setRepeatProgress(null);
     }
   };
 
@@ -226,6 +239,17 @@ function ExtensionDetailPage({
               onChange={(event) => updateWithdrawInput('authenticatorCode', event.target.value)}
             />
           </label>
+          <label>
+            Repeat
+            <input
+              type="number"
+              min={1}
+              step={1}
+              value={repeat}
+              onChange={(event) => setRepeat(Math.max(1, Math.floor(Number(event.target.value) || 1)))}
+              disabled={sending}
+            />
+          </label>
           <button
             type="submit"
             className="button"
@@ -237,11 +261,24 @@ function ExtensionDetailPage({
               !withdrawInput.amount.trim()
             }
           >
-            {sending ? 'Sending...' : hasActiveOrders ? 'Order in progress...' : 'Send withdraw order'}
+            {sending && repeatProgress
+              ? `Sending ${repeatProgress.current}/${repeatProgress.total}...`
+              : sending
+                ? 'Sending...'
+                : hasActiveOrders
+                  ? 'Order in progress...'
+                  : repeat > 1
+                    ? `Send withdraw order (${repeat}x)`
+                    : 'Send withdraw order'}
           </button>
         </form>
-        {hasActiveOrders && (
+        {hasActiveOrders && !sending && (
           <p className="subtle">This extension is running an order. Wait for it to finish before sending another.</p>
+        )}
+        {sending && repeatProgress && repeatProgress.total > 1 && (
+          <p className="subtle">
+            Running order {repeatProgress.current} of {repeatProgress.total}. The next order starts when this one finishes.
+          </p>
         )}
         <p className="subtle">
           The extension opens Bitunix withdraw, submits the form, waits for the email code from the backend Gmail service,

@@ -21,34 +21,65 @@ export const BITUNIX_HOST = 'www.bitunix.com';
 export const WITHDRAW_PATH = '/assets/withdraw';
 export const WAIT = { short: 20000, medium: 60000, long: 120000, poll: 500 } as const;
 
+function findWithdrawFormRoot(): ParentNode {
+  return document.querySelector('#assets-withdraw') || document;
+}
+
 function findSymbolSelectWrapper(): HTMLElement | null {
-  return visibleElements<HTMLElement>('.symbol-select-wrapper')[0] || null;
+  const root = findWithdrawFormRoot();
+  return (
+    visibleElements<HTMLElement>('.symbol-select-wrapper', root)[0] ||
+    visibleElements<HTMLElement>('.symbol-select-wrapper')[0] ||
+    null
+  );
+}
+
+function readVisibleSelectValue(wrapper: ParentNode): string {
+  const selectedValue = wrapper.querySelector('.arco-select-view-value');
+  if (selectedValue && !selectedValue.classList.contains('arco-select-view-value-hidden')) {
+    return elementText(selectedValue);
+  }
+
+  const selectInput = wrapper.querySelector('.select_input');
+  if (selectInput) {
+    return elementText(selectInput);
+  }
+
+  return '';
 }
 
 function isCoinSelected(currency: string): boolean {
   const wrapper = findSymbolSelectWrapper();
   if (!wrapper) return false;
   const normalizedCurrency = normalize(currency);
+
   const hotActive = visibleElements<HTMLElement>('.hot_currency_btn', wrapper).find(
     (button) => elementText(button) === normalizedCurrency && /\bactive\b/i.test(button.className.toString())
   );
   if (hotActive) return true;
 
-  const searchInput = wrapper.querySelector<HTMLInputElement>('input.arco-select-view-input');
-  if (searchInput?.value && normalize(searchInput.value) === normalizedCurrency) {
-    return true;
+  const selectedText = readVisibleSelectValue(wrapper);
+  if (selectedText) {
+    return selectedText === normalizedCurrency || selectedText.startsWith(`${normalizedCurrency} `);
   }
 
-  const selectedValue = wrapper.querySelector('.arco-select-view-value');
-  if (selectedValue && !selectedValue.classList.contains('arco-select-view-value-hidden')) {
-    return includesAny(elementText(selectedValue), [currency]);
-  }
+  return false;
+}
 
-  return includesAny(elementText(wrapper), [currency]);
+function assertCoinSelected(currency: string): void {
+  if (!isCoinSelected(currency)) {
+    throw new Error(`Coin "${currency}" was not selected`);
+  }
+}
+
+async function dismissOpenDropdowns(): Promise<void> {
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  await stepDelay();
 }
 
 async function waitForCoinSelected(currency: string): Promise<void> {
-  await waitFor(() => isCoinSelected(currency) || Boolean(findNetworkSearchInput()), WAIT.long);
+  await waitFor(() => (isCoinSelected(currency) ? true : null), WAIT.long);
+  assertCoinSelected(currency);
   await stepDelay();
 }
 
@@ -65,7 +96,10 @@ function findCoinHotButton(currency: string): HTMLElement | null {
 function findCoinSearchInput(): HTMLInputElement | null {
   const wrapper = findSymbolSelectWrapper();
   if (!wrapper) return null;
-  return wrapper.querySelector<HTMLInputElement>('input.arco-select-view-input[placeholder*="coin" i]');
+  return (
+    wrapper.querySelector<HTMLInputElement>('input.arco-select-view-input[placeholder*="coin" i]') ||
+    wrapper.querySelector<HTMLInputElement>('input.arco-select-view-input')
+  );
 }
 
 function findCoinOptionInDropdown(currency: string): HTMLElement | null {
@@ -88,17 +122,29 @@ async function openCoinDropdown(): Promise<HTMLInputElement> {
   return input;
 }
 
-async function selectCoin(currency: string): Promise<void> {
-  await stepDelay();
+async function selectCoinViaHotButton(currency: string): Promise<boolean> {
   const hotButton = findCoinHotButton(currency);
-  if (hotButton) {
-    clickElement(hotButton);
+  if (!hotButton) return false;
+
+  clickElement(hotButton);
+  try {
     await waitForCoinSelected(currency);
-    return;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function selectCoinViaDropdown(currency: string): Promise<void> {
+  const input = await openCoinDropdown();
+  setFieldValue(input, currency, { blur: false });
+  await stepDelay();
+
+  if (!includesAny(input.value, [currency])) {
+    typeFieldValue(input, currency);
+    await stepDelay();
   }
 
-  const input = await openCoinDropdown();
-  setFieldValue(input, currency);
   input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
   await stepDelay();
 
@@ -107,13 +153,55 @@ async function selectCoin(currency: string): Promise<void> {
   await waitForCoinSelected(currency);
 }
 
+async function selectCoin(currency: string): Promise<void> {
+  await dismissOpenDropdowns();
+
+  if (isCoinSelected(currency)) {
+    assertCoinSelected(currency);
+    return;
+  }
+
+  const hotWorked = await selectCoinViaHotButton(currency);
+  if (hotWorked) {
+    assertCoinSelected(currency);
+    return;
+  }
+
+  await dismissOpenDropdowns();
+  await selectCoinViaDropdown(currency);
+  assertCoinSelected(currency);
+}
+
 function findNetworkSection(): ParentNode {
   return document.querySelector('#net') || visibleElements<HTMLElement>('.form_item').find((item) => includesAny(elementText(item), ['network'])) || document;
 }
 
 function findNetworkSearchInput(): HTMLInputElement | null {
   const section = findNetworkSection();
-  return section.querySelector<HTMLInputElement>('input.arco-select-view-input[placeholder*="network" i]');
+  return (
+    section.querySelector<HTMLInputElement>('input.arco-select-view-input[placeholder*="network" i]') ||
+    section.querySelector<HTMLInputElement>('input.arco-select-view-input')
+  );
+}
+
+function isChainSelected(chain: string): boolean {
+  const section = findNetworkSection();
+  const normalizedChain = normalize(chain);
+  const selectedText = readVisibleSelectValue(section);
+  if (selectedText) {
+    return selectedText === normalizedChain || selectedText.includes(normalizedChain);
+  }
+
+  const input = findNetworkSearchInput();
+  if (!input?.value.trim()) return false;
+  const inputValue = normalize(input.value);
+  return inputValue === normalizedChain || inputValue.includes(normalizedChain);
+}
+
+function assertChainSelected(chain: string): void {
+  if (!isChainSelected(chain)) {
+    throw new Error(`Network "${chain}" was not selected`);
+  }
 }
 
 function findChainOptions(): HTMLElement[] {
@@ -159,6 +247,8 @@ async function selectChain(chain: string, currency: string): Promise<void> {
         throw new Error(`Network option "${chain}" is not available yet`);
       }
       clickElement(option);
+      await waitFor(() => (isChainSelected(chain) ? true : null), WAIT.medium);
+      assertChainSelected(chain);
       await stepDelay();
       return;
     } catch (error) {
@@ -433,10 +523,34 @@ export async function runWithdraw(message: TokenAutomationMessage): Promise<Auto
   await waitFor(() => document.body && document.body.innerText.length > 100, WAIT.long);
   await stepDelay();
 
-  await retryStep('Select coin', () => selectCoin(request.currency), writeStatus);
-  await retryStep('Select network', () => selectChain(request.chain, request.currency), writeStatus);
-  await retryStep('Fill withdrawal address', () => fillWithdrawAddress(request.address), writeStatus);
-  await retryStep('Fill withdrawal amount', () => fillAmount(request.amount), writeStatus);
+  await retryStep('Select coin', () => selectCoin(request.currency), writeStatus, 5, () => isCoinSelected(request.currency));
+  await retryStep(
+    'Select network',
+    () => selectChain(request.chain, request.currency),
+    writeStatus,
+    5,
+    () => isCoinSelected(request.currency) && isChainSelected(request.chain)
+  );
+  await retryStep(
+    'Fill withdrawal address',
+    () => fillWithdrawAddress(request.address),
+    writeStatus,
+    4,
+    () => {
+      const textarea = findWithdrawAddressTextarea();
+      return Boolean(textarea && textarea.value.trim() === request.address.trim());
+    }
+  );
+  await retryStep(
+    'Fill withdrawal amount',
+    () => fillAmount(request.amount),
+    writeStatus,
+    4,
+    () => {
+      const input = findWithdrawAmountInput();
+      return Boolean(input && input.value.trim() === request.amount.trim());
+    }
+  );
   await retryStep('Submit withdraw form', clickWithdrawSubmit, writeStatus);
 
   const confirmButton = await waitFor(() => findButtonByText(['Confirm', 'OK', 'Continue']), WAIT.short).catch(() => null);

@@ -17,7 +17,40 @@ const LABELED_CODE_PATTERNS = [
   /code\s*[:：]\s*(\d{6})\b/i
 ];
 
+/** Bitunix uses 000000 as a placeholder in stale or wrong verification emails. */
+const INVALID_VERIFICATION_CODES = new Set(['000000']);
+
+const VERIFICATION_REQUEST_HINTS = [
+  /\b(?:email|security|withdraw(?:al)?)\s+verification\s+code\b/i,
+  /\bverification\s+code\b/i,
+  /\b(?:your|the)\s+(?:email\s+)?verification\s+code\s+is\b/i,
+  /\benter\s+(?:the\s+)?verification\s+code\b/i,
+  /\bwithdraw(?:al)?\s+(?:security\s+)?verification\b/i,
+  /\bsecurity\s+verification\s+code\b/i
+];
+
 export class BitunixEmailParser {
+  static isValidVerificationCode(code: string): boolean {
+    return /^\d{6}$/.test(code) && !INVALID_VERIFICATION_CODES.has(code);
+  }
+
+  /** True when the message is a withdraw/security code email, not login alerts or other notices. */
+  static isVerificationRequestEmail(subject: string, bodyOrSnippet = ''): boolean {
+    const text = `${subject}\n${bodyOrSnippet}`.replace(/\s+/g, ' ').trim();
+    if (!text) return false;
+    if (!VERIFICATION_REQUEST_HINTS.some((pattern) => pattern.test(text))) return false;
+
+    if (/\b(?:login|log[- ]?in|sign[- ]?in)\b/i.test(text) && !/\bwithdraw/i.test(text)) return false;
+    if (/\bwithdraw(?:al)?\s+(?:completed|successful|succeeded|processed)\b/i.test(text)) return false;
+    if (
+      /\b(?:deposit|staking|password\s*reset|new\s+device|airdrop|promotion)\b/i.test(text) &&
+      !/\bwithdraw(?:al)?\s+(?:verification|security)\b/i.test(text)
+    ) {
+      return false;
+    }
+
+    return true;
+  }
   static extractCode(text: string): string | null {
     const normalized = text.replace(/\s+/g, ' ').trim();
     if (!normalized) return null;
@@ -253,8 +286,14 @@ export class GmailService {
       if (this.store.isMessageUsed(message.accountId, message.id)) continue;
       if (!BitunixEmailParser.isBitunixSender(message.from)) continue;
       if (!BitunixEmailParser.isNearSendTime(new Date(message.receivedAt).getTime(), sentAt)) continue;
+      if (!BitunixEmailParser.isVerificationRequestEmail(message.subject, message.snippet)) continue;
       const code = message.verificationCode || BitunixEmailParser.extractCode(`${message.subject}\n${message.snippet}`);
-      if (code) return { code, message };
+      if (!code) continue;
+      if (!BitunixEmailParser.isValidVerificationCode(code)) {
+        this.store.markMessageUsed({ accountId: message.accountId, messageId: message.id });
+        continue;
+      }
+      return { code, message };
     }
     return null;
   }
@@ -283,7 +322,13 @@ export class GmailService {
     const from = this.header(message.payload?.headers, 'From');
     const subject = this.header(message.payload?.headers, 'Subject');
     const text = BitunixEmailParser.collectBodyText(message.payload || {});
-    const verificationCode = BitunixEmailParser.extractCode(`${subject}\n${text}\n${message.snippet || ''}`);
+    const bodyOrSnippet = `${text}\n${message.snippet || ''}`;
+    const isVerificationRequest = BitunixEmailParser.isVerificationRequestEmail(subject, bodyOrSnippet);
+    const extracted = isVerificationRequest
+      ? BitunixEmailParser.extractCode(`${subject}\n${bodyOrSnippet}`)
+      : null;
+    const verificationCode =
+      extracted && BitunixEmailParser.isValidVerificationCode(extracted) ? extracted : undefined;
     return {
       id: message.id,
       accountId,
@@ -291,7 +336,7 @@ export class GmailService {
       from,
       receivedAt: new Date(Number(message.internalDate)).toISOString(),
       snippet: message.snippet || '',
-      verificationCode: verificationCode || undefined
+      verificationCode
     };
   }
 

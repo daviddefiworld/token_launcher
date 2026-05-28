@@ -1,4 +1,62 @@
+import { getOrders } from './api';
 import type { ActivityItem, AutomationOrder, VerificationCodeRequest } from './types';
+
+const ACTIVE_ORDER_STATUSES = new Set<AutomationOrder['status']>(['pending', 'executing']);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+export async function waitForExtensionIdle(
+  extensionId: string,
+  options?: { pollMs?: number; maxWaitMs?: number; stableMs?: number }
+): Promise<void> {
+  const pollMs = options?.pollMs ?? 2000;
+  const stableMs = options?.stableMs ?? 3000;
+  const maxWaitMs = options?.maxWaitMs ?? 30 * 60 * 1000;
+  const deadline = Date.now() + maxWaitMs;
+  let idleSince: number | null = null;
+
+  while (Date.now() < deadline) {
+    const orders = await getOrders(extensionId);
+    const hasActive = orders.some((order) => ACTIVE_ORDER_STATUSES.has(order.status));
+    if (!hasActive) {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= stableMs) {
+        return;
+      }
+    } else {
+      idleSince = null;
+    }
+    await sleep(pollMs);
+  }
+
+  throw new Error('Timed out waiting for extension to become idle');
+}
+
+export async function waitForOrderCompleted(
+  extensionId: string,
+  orderId: string,
+  options?: { pollMs?: number; maxWaitMs?: number }
+): Promise<AutomationOrder> {
+  const pollMs = options?.pollMs ?? 2000;
+  const maxWaitMs = options?.maxWaitMs ?? 30 * 60 * 1000;
+  const deadline = Date.now() + maxWaitMs;
+
+  while (Date.now() < deadline) {
+    const orders = await getOrders(extensionId);
+    const order = orders.find((item) => item.orderId === orderId);
+    if (order?.status === 'completed') {
+      return order;
+    }
+    if (order?.status === 'failed') {
+      throw new Error(order.error || 'Order failed');
+    }
+    await sleep(pollMs);
+  }
+
+  throw new Error('Timed out waiting for order to complete');
+}
 
 export function formatRelativeTime(value: string | undefined): string {
   if (!value) return 'never';

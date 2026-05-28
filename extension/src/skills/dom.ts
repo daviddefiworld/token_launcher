@@ -151,16 +151,25 @@ export async function retryStep<T>(
   label: string,
   action: () => Promise<T>,
   writeStatusFn: (text: string) => void,
-  attempts = 4
+  attempts = 4,
+  verify?: () => boolean | Promise<boolean>
 ): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await action();
+      const result = await action();
+      if (verify) {
+        const verified = await verify();
+        if (!verified) {
+          throw new Error(`${label} did not complete`);
+        }
+      }
+      return result;
     } catch (error) {
       lastError = error;
       if (attempt < attempts) {
         writeStatusFn(`${label} failed, retrying (${attempt}/${attempts})...`);
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
         await delay(1500 * attempt);
       }
     }

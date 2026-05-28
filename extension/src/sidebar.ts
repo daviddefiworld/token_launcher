@@ -43,6 +43,8 @@ interface ContentPingResponse {
 let socket: Socket | null = null;
 let extensionId = '';
 let runningOrderId: string | null = null;
+const orderQueue: RunOrderPayload[] = [];
+let drainingOrderQueue = false;
 
 const backendInput = document.getElementById('backend-url') as HTMLInputElement;
 const saveButton = document.getElementById('save-backend') as HTMLButtonElement;
@@ -317,7 +319,7 @@ function requestVerificationCodeFromBackend(orderId: string, emailCodeSentAt: nu
 
 async function resolveEmailCode(orderId: string, emailCodeSentAt: number, providedCode?: string): Promise<string> {
   const trimmed = providedCode?.trim();
-  if (trimmed) return trimmed;
+  if (trimmed && trimmed !== '000000') return trimmed;
 
   setMessage('Requesting verification code from Gmail (backend)...');
   return requestVerificationCodeFromBackend(orderId, emailCodeSentAt);
@@ -444,26 +446,51 @@ async function runOrder(payload: RunOrderPayload): Promise<void> {
       ORDER_TIMEOUT_MS,
       'Order timed out after 5 minutes'
     );
+    setMessage('Withdraw complete. Waiting before opening wallet...');
+    await delay(POST_SUCCESS_WALLET_DELAY_MS);
+    await moveToBitunixWallet(bitunixTabId, 'Opening Bitunix wallet...');
 
     socket?.emit('extension:order_result', {
       orderId: payload.orderId,
       status: 'completed',
       output: result
     });
-
-    setMessage('Withdraw complete. Waiting before opening wallet...');
-    await delay(POST_SUCCESS_WALLET_DELAY_MS);
-    await moveToBitunixWallet(bitunixTabId, 'Opening Bitunix wallet...');
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Order failed';
+    setMessage(message);
+    await moveToBitunixWallet(bitunixTabId, 'Withdraw failed. Opening Bitunix wallet...');
     socket?.emit('extension:order_result', {
       orderId: payload.orderId,
       status: 'failed',
       error: message
     });
-    setMessage(message);
-    await moveToBitunixWallet(bitunixTabId, 'Withdraw failed. Opening Bitunix wallet...');
   }
+}
+
+async function drainOrderQueue(): Promise<void> {
+  if (drainingOrderQueue) return;
+  drainingOrderQueue = true;
+  try {
+    while (orderQueue.length > 0) {
+      const payload = orderQueue.shift()!;
+      runningOrderId = payload.orderId;
+      try {
+        await runOrder(payload);
+      } finally {
+        if (runningOrderId === payload.orderId) runningOrderId = null;
+      }
+    }
+  } finally {
+    drainingOrderQueue = false;
+    if (orderQueue.length > 0) {
+      void drainOrderQueue();
+    }
+  }
+}
+
+function enqueueOrder(payload: RunOrderPayload): void {
+  orderQueue.push(payload);
+  void drainOrderQueue();
 }
 
 async function connect(): Promise<void> {
@@ -515,19 +542,7 @@ async function connect(): Promise<void> {
   });
 
   socket.on('extension:run_order', (payload: RunOrderPayload) => {
-    if (runningOrderId) {
-      socket?.emit('extension:order_result', {
-        orderId: payload.orderId,
-        status: 'failed',
-        error: 'Extension is already running an order'
-      });
-      return;
-    }
-
-    runningOrderId = payload.orderId;
-    void runOrder(payload).finally(() => {
-      if (runningOrderId === payload.orderId) runningOrderId = null;
-    });
+    enqueueOrder(payload);
   });
 }
 
