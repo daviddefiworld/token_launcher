@@ -6,6 +6,8 @@ import type {
   CachedGmailMessage,
   GmailAccount,
   GmailStoreSnapshot,
+  TokenLaunchJob,
+  TokenLaunchInput,
   UsedGmailMessage,
   VerificationCodeRequest,
   WithdrawRequest
@@ -114,13 +116,34 @@ export class OrderRepository {
     return updated;
   }
 
+  cancel(orderId: string): AutomationOrder | null {
+    const order = this.orders.get(orderId);
+    if (!order) return null;
+    if (order.status !== 'pending' && order.status !== 'executing') return null;
+    const finishedAt = Date.now();
+    const executingAtMs = order.executingAt ? new Date(order.executingAt).getTime() : undefined;
+    const executeTimeMs =
+      executingAtMs !== undefined && Number.isFinite(executingAtMs) ? Math.max(0, finishedAt - executingAtMs) : undefined;
+    const updated: AutomationOrder = {
+      ...order,
+      status: 'cancelled',
+      error: 'Cancelled by user',
+      output: { completedAt: nowIso() },
+      executeTimeMs,
+      updatedAt: nowIso()
+    };
+    this.orders.set(orderId, updated);
+    this.persist();
+    return updated;
+  }
+
   complete(
     orderId: string,
     patch: { status: 'completed' | 'failed'; output?: AutomationOrder['output']; error?: string }
   ): AutomationOrder | null {
     const order = this.orders.get(orderId);
     if (!order) return null;
-    if (order.status === 'completed' || order.status === 'failed') return order;
+    if (order.status === 'completed' || order.status === 'failed' || order.status === 'cancelled') return order;
     const finishedAt = Date.now();
     const executingAtMs = order.executingAt ? new Date(order.executingAt).getTime() : undefined;
     const executeTimeMs =
@@ -139,6 +162,95 @@ export class OrderRepository {
     const updated: AutomationOrder = { ...order, ...patch, orderId: order.orderId, updatedAt: nowIso() };
     this.orders.set(orderId, updated);
     this.persist();
+    return updated;
+  }
+}
+
+export class TokenLaunchRepository {
+  private readonly jobs = new Map<string, TokenLaunchJob>();
+  private readonly file = new JsonFileStore<TokenLaunchJob[]>(path.join(DATA_DIR, 'token-launches.json'));
+
+  constructor() {
+    this.file.read([]).forEach((job) => {
+      if (job?.jobId) this.jobs.set(job.jobId, job);
+    });
+  }
+
+  private persist(): void {
+    this.file.write([...this.jobs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  }
+
+  list(): TokenLaunchJob[] {
+    return [...this.jobs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  get(jobId: string): TokenLaunchJob | undefined {
+    return this.jobs.get(jobId);
+  }
+
+  findActive(): TokenLaunchJob | undefined {
+    const activeStatuses = new Set<TokenLaunchJob['status']>([
+      'pending',
+      'deploying',
+      'adding_liquidity',
+      'monitoring',
+      'buying',
+      'removing_liquidity'
+    ]);
+    return [...this.jobs.values()].find((job) => activeStatuses.has(job.status));
+  }
+
+  create(
+    input: TokenLaunchInput,
+    meta?: Pick<TokenLaunchJob, 'repeatIndex' | 'repeatTotal'>
+  ): TokenLaunchJob {
+    const repeatTotal = meta?.repeatTotal ?? input.repeatCount;
+    const repeatIndex = meta?.repeatIndex;
+    const queuedPhase =
+      repeatTotal > 1 && repeatIndex ? `Queued (${repeatIndex}/${repeatTotal})` : 'Queued';
+    const job: TokenLaunchJob = {
+      jobId: randomUUID(),
+      status: 'pending',
+      input,
+      repeatIndex,
+      repeatTotal: repeatTotal > 1 ? repeatTotal : undefined,
+      buyerCount: 0,
+      lpRemoved: false,
+      wallet2BuyExecuted: false,
+      wallet3BuyExecuted: false,
+      phase: queuedPhase,
+      createdAt: nowIso(),
+      updatedAt: nowIso()
+    };
+    this.jobs.set(job.jobId, job);
+    this.persist();
+    return job;
+  }
+
+  update(jobId: string, patch: Partial<TokenLaunchJob>): TokenLaunchJob | null {
+    const job = this.jobs.get(jobId);
+    if (!job) return null;
+    const updated: TokenLaunchJob = { ...job, ...patch, jobId: job.jobId, updatedAt: nowIso() };
+    this.jobs.set(jobId, updated);
+    this.persist();
+    return updated;
+  }
+
+  markLpRemovedForPool(poolAddress: string, removeLiquidityTxHash: string): TokenLaunchJob[] {
+    const normalized = poolAddress.toLowerCase();
+    const updated: TokenLaunchJob[] = [];
+    for (const [jobId, job] of this.jobs) {
+      if (job.poolAddress?.toLowerCase() !== normalized) continue;
+      const next: TokenLaunchJob = {
+        ...job,
+        lpRemoved: true,
+        removeLiquidityTxHash,
+        updatedAt: nowIso()
+      };
+      this.jobs.set(jobId, next);
+      updated.push(next);
+    }
+    if (updated.length > 0) this.persist();
     return updated;
   }
 }

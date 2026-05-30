@@ -5,11 +5,13 @@ import express, { Request, Response, Router } from 'express';
 import { createServer, Server as HttpServer } from 'http';
 import { Server, Socket } from 'socket.io';
 import { GmailService } from './gmail';
-import { GmailRepository, OrderRepository, VerificationRepository, nowIso } from './persist';
+import { GmailRepository, OrderRepository, TokenLaunchRepository, VerificationRepository, nowIso } from './persist';
+import { TokenLaunchInputParser, TokenLaunchService } from './skills/tokenlaunch';
 import type {
   ActivityItem,
   AutomationOrder,
   ExtensionRecord,
+  TokenLaunchJob,
   VerificationCodeRequest,
   WithdrawRequest
 } from './types';
@@ -55,15 +57,20 @@ class TotpAuthenticator {
 }
 
 class ActivityFeed {
-  constructor(private readonly verification: VerificationRepository) {}
+  constructor(
+    private readonly verification: VerificationRepository,
+    private readonly tokenLaunches: TokenLaunchRepository
+  ) {}
 
   build(orders: AutomationOrder[], extensionId?: string): ActivityItem[] {
     const verification = this.verification.list(extensionId);
+    const launches = this.tokenLaunches.list();
     const items: ActivityItem[] = [
       ...orders
         .filter((o) => !extensionId || o.extensionId === extensionId)
         .map((o) => ActivityFeed.fromOrder(o)),
-      ...verification.map((r) => ActivityFeed.fromVerification(r))
+      ...verification.map((r) => ActivityFeed.fromVerification(r)),
+      ...launches.map((job) => ActivityFeed.fromTokenLaunch(job))
     ];
     return items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
@@ -110,6 +117,31 @@ class ActivityFeed {
       updatedAt: request.updatedAt
     };
   }
+
+  private static fromTokenLaunch(job: TokenLaunchJob): ActivityItem {
+    return {
+      id: job.jobId,
+      kind: 'token_launch',
+      extensionId: 'tokenlaunch',
+      status: job.status,
+      title: `Token launch: ${job.input.tokenName}`,
+      summary: `${job.input.lpEthAmount} ETH LP on Base · ${job.phase || job.status}`,
+      tokenLaunch: {
+        tokenName: job.input.tokenName,
+        tokenSymbol: job.input.tokenSymbol,
+        lpEthAmount: job.input.lpEthAmount,
+        buyEthAmount: job.input.buyEthAmount,
+        tokenAddress: job.tokenAddress,
+        poolAddress: job.poolAddress,
+        buyerCount: job.buyerCount,
+        phase: job.phase
+      },
+      error: job.error,
+      message: job.phase,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt
+    };
+  }
 }
 
 class WithdrawInputParser {
@@ -141,10 +173,14 @@ class WithdrawInputParser {
 
 export class TokenAutomationApp {
   private readonly orders = new OrderRepository();
+  private readonly tokenLaunches = new TokenLaunchRepository();
   private readonly gmailStore = new GmailRepository();
   private readonly verificationStore = new VerificationRepository();
   private readonly gmail = new GmailService(this.gmailStore);
-  private readonly activity = new ActivityFeed(this.verificationStore);
+  private readonly activity = new ActivityFeed(this.verificationStore, this.tokenLaunches);
+  private readonly tokenLaunch = new TokenLaunchService(this.tokenLaunches, (job, event) =>
+    this.io.to('dashboards').emit(`tokenlaunch:${event}`, { job })
+  );
   private readonly totp = new TotpAuthenticator();
   private readonly extensions = new Map<string, ExtensionRecord>();
 
@@ -163,6 +199,7 @@ export class TokenAutomationApp {
     });
     app.use('/api/gmails', this.gmailRoutes());
     app.use('/api/verification-requests', this.verificationRoutes());
+    app.use('/api/tokenlaunch', this.tokenLaunchRoutes());
     this.coreRoutes(app);
 
     this.io.on('connection', (socket) => this.onSocket(socket));
@@ -216,6 +253,126 @@ export class TokenAutomationApp {
         res.status(400).json({ success: false, error: message });
       }
     });
+
+    app.post('/api/orders/:orderId/cancel', (req, res) => {
+      try {
+        const order = this.cancelOrder(req.params.orderId);
+        res.json({ success: true, data: order });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to cancel order';
+        const status = message.includes('not found')
+          ? 404
+          : message.includes('Only active')
+            ? 409
+            : 400;
+        res.status(status).json({ success: false, error: message });
+      }
+    });
+  }
+
+  private tokenLaunchRoutes(): Router {
+    const router = Router();
+
+    router.get('/status', (_req, res) => {
+      try {
+        res.json({ success: true, data: this.tokenLaunch.getStatus() });
+      } catch (error) {
+        res.status(503).json({ success: false, error: error instanceof Error ? error.message : 'Token launch unavailable' });
+      }
+    });
+
+    router.get('/', (_req, res) => {
+      res.json({ success: true, data: this.tokenLaunch.list() });
+    });
+
+    router.get('/lp/unremoved', async (_req, res) => {
+      try {
+        const positions = await this.tokenLaunch.listUnremovedLp();
+        res.json({ success: true, data: positions });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to list unremoved LP';
+        res.status(message.includes('must be set') ? 503 : 500).json({ success: false, error: message });
+      }
+    });
+
+    router.post('/lp/remove', async (req, res) => {
+      try {
+        const body = req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
+        const poolAddress = typeof body.poolAddress === 'string' ? body.poolAddress.trim() : '';
+        const all = body.all === true;
+        const results = await this.tokenLaunch.removeUnremovedLp(
+          all ? { all: true } : { poolAddress }
+        );
+        res.json({ success: true, data: results });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to remove LP';
+        const status = message.includes('running') ? 409 : message.includes('must be set') ? 503 : 400;
+        res.status(status).json({ success: false, error: message });
+      }
+    });
+
+    router.post('/:jobId/finish', (req, res) => {
+      try {
+        const job = this.tokenLaunch.finish(req.params.jobId);
+        res.json({ success: true, data: job });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to finish launch';
+        const status = message.includes('not found')
+          ? 404
+          : message.includes('Only active')
+            ? 409
+            : 400;
+        res.status(status).json({ success: false, error: message });
+      }
+    });
+
+    router.post('/:jobId/buy', async (req, res) => {
+      try {
+        const body = req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
+        const walletRaw = body.wallet;
+        const wallet =
+          walletRaw === 2 || walletRaw === '2' ? 2 : walletRaw === 3 || walletRaw === '3' ? 3 : null;
+        if (wallet === null) {
+          res.status(400).json({ success: false, error: 'wallet must be 2 or 3' });
+          return;
+        }
+        const ethAmount = typeof body.ethAmount === 'string' ? body.ethAmount.trim() : undefined;
+        const job = await this.tokenLaunch.manualBuy(req.params.jobId, wallet, ethAmount);
+        res.json({ success: true, data: job });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Manual buy failed';
+        const status = message.includes('not found')
+          ? 404
+          : message.includes('not available') || message.includes('not ready') || message.includes('in progress')
+            ? 409
+            : message.includes('must be set')
+              ? 503
+              : 400;
+        res.status(status).json({ success: false, error: message });
+      }
+    });
+
+    router.get('/:jobId', (req, res) => {
+      const job = this.tokenLaunch.get(req.params.jobId);
+      if (!job) {
+        res.status(404).json({ success: false, error: 'Token launch job not found' });
+        return;
+      }
+      res.json({ success: true, data: job });
+    });
+
+    router.post('/', (req, res) => {
+      try {
+        const job = this.tokenLaunch.start(TokenLaunchInputParser.parse(req.body));
+        res.status(201).json({ success: true, data: job });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Invalid token launch request';
+        const status = message.includes('already running') ? 409 : message.includes('must be set') ? 503 : 400;
+        res.status(status).json({ success: false, error: message });
+      }
+    });
+
+    return router;
   }
 
   private gmailRoutes(): Router {
@@ -341,6 +498,7 @@ export class TokenAutomationApp {
         socketId: socket.id,
         extensions: this.listExtensions(),
         orders: this.orders.list(),
+        tokenLaunches: this.tokenLaunch.list(),
         activity: this.activity.build(this.orders.list())
       });
     });
@@ -441,6 +599,8 @@ export class TokenAutomationApp {
       'extension:order_result',
       (data: { orderId?: string; status?: AutomationOrder['status']; error?: string; output?: AutomationOrder['output'] }) => {
         if (!data.orderId) return;
+        const existing = this.orders.get(data.orderId);
+        if (existing?.status === 'cancelled') return;
         const status = data.status === 'failed' ? 'failed' : 'completed';
         const order = this.orders.complete(data.orderId, { status, output: data.output, error: data.error });
         if (order) this.broadcastOrder(order);
@@ -468,6 +628,21 @@ export class TokenAutomationApp {
 
   private broadcastOrder(order: AutomationOrder): void {
     this.io.to('dashboards').emit('orders:updated', { order });
+  }
+
+  private cancelOrder(orderId: string): AutomationOrder {
+    this.flushExpiredOrders();
+    const id = orderId.trim();
+    const order = this.orders.get(id);
+    if (!order) throw new Error('Order not found');
+    if (order.status !== 'pending' && order.status !== 'executing') {
+      throw new Error('Only active orders can be cancelled');
+    }
+    const cancelled = this.orders.cancel(id);
+    if (!cancelled) throw new Error('Order not found');
+    this.emitToExtension(cancelled.extensionId, 'extension:cancel_order', { orderId: cancelled.orderId });
+    this.broadcastOrder(cancelled);
+    return cancelled;
   }
 
   private createOrder(extensionId: string, input: WithdrawRequest, res?: Response): AutomationOrder | null {
