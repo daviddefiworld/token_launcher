@@ -31,7 +31,14 @@ WALLET_3_PRIVATE_KEY=   # optional second buy wallet
 
 ## Dashboard
 
-Open **Token Launch** in the nav for the control panel.
+Open **Token Launch** in the nav for the control panel. Each launch with a pool has **View analyzer** — Aerodrome swap history (buys/sells, traders, own vs external wallets).
+
+## Trade analyzer API
+
+- `GET /api/tokenlaunch/:jobId/trades` — cached trades + stats (`?refresh=true` to re-fetch from chain)
+- `POST /api/tokenlaunch/trades/backfill` — `{ "onlyMissing": true }` (default) backfills all launches; set `onlyMissing: false` to refresh every job
+
+On backend startup, launches missing trades are backfilled automatically (when wallets/RPC are configured).
 
 ## Stranded LP cleanup
 

@@ -5,12 +5,15 @@ import express, { Request, Response, Router } from 'express';
 import { createServer, Server as HttpServer } from 'http';
 import { Server, Socket } from 'socket.io';
 import { GmailService } from './gmail';
-import { GmailRepository, OrderRepository, TokenLaunchRepository, VerificationRepository, nowIso } from './persist';
+import { networkTime } from './networkTime';
+import { GmailRepository, OrderRepository, TokenLaunchRepository, VerificationRepository, WorkflowRepository, nowIso } from './persist';
 import { TokenLaunchInputParser, TokenLaunchService } from './skills/tokenlaunch';
+import { LaunchWorkflowInputParser, LaunchWorkflowService } from './workflow';
 import type {
   ActivityItem,
   AutomationOrder,
   ExtensionRecord,
+  LaunchWorkflow,
   TokenLaunchJob,
   VerificationCodeRequest,
   WithdrawRequest
@@ -20,13 +23,14 @@ const BASE32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 const PORT = Number(process.env.PORT || 5050);
 
 class TotpAuthenticator {
-  generate(): string {
+  async generate(): Promise<string> {
     const secret = process.env.GOOGLE_AUTHENTICATOR_SECRET?.trim();
     if (!secret) throw new Error('GOOGLE_AUTHENTICATOR_SECRET is not configured in backend/.env');
-    return TotpAuthenticator.code(secret);
+    await networkTime.sync();
+    return TotpAuthenticator.code(secret, networkTime.now());
   }
 
-  private static code(secret: string, timestampMs = Date.now(), stepSeconds = 30): string {
+  private static code(secret: string, timestampMs: number, stepSeconds = 30): string {
     const key = TotpAuthenticator.decodeSecret(secret.trim().replace(/^secret=/i, ''));
     const counter = Math.floor(timestampMs / 1000 / stepSeconds);
     const buffer = Buffer.alloc(8);
@@ -59,18 +63,21 @@ class TotpAuthenticator {
 class ActivityFeed {
   constructor(
     private readonly verification: VerificationRepository,
-    private readonly tokenLaunches: TokenLaunchRepository
+    private readonly tokenLaunches: TokenLaunchRepository,
+    private readonly workflows: WorkflowRepository
   ) {}
 
   build(orders: AutomationOrder[], extensionId?: string): ActivityItem[] {
     const verification = this.verification.list(extensionId);
     const launches = this.tokenLaunches.list();
+    const workflowItems = this.workflows.list();
     const items: ActivityItem[] = [
       ...orders
         .filter((o) => !extensionId || o.extensionId === extensionId)
         .map((o) => ActivityFeed.fromOrder(o)),
       ...verification.map((r) => ActivityFeed.fromVerification(r)),
-      ...launches.map((job) => ActivityFeed.fromTokenLaunch(job))
+      ...launches.map((job) => ActivityFeed.fromTokenLaunch(job)),
+      ...workflowItems.map((workflow) => ActivityFeed.fromLaunchWorkflow(workflow))
     ];
     return items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
@@ -142,6 +149,28 @@ class ActivityFeed {
       updatedAt: job.updatedAt
     };
   }
+
+  private static fromLaunchWorkflow(workflow: LaunchWorkflow): ActivityItem {
+    return {
+      id: workflow.workflowId,
+      kind: 'launch_workflow',
+      extensionId: workflow.input.extensionId,
+      status: workflow.status,
+      title: `Launch workflow: ${workflow.input.tokenLaunch.tokenName}`,
+      summary: `${workflow.input.walletCount} wallets · ${workflow.phase || workflow.status}`,
+      launchWorkflow: {
+        walletCount: workflow.input.walletCount,
+        autoStartLaunch: workflow.input.autoStartLaunch,
+        launchJobId: workflow.launchJobId,
+        phase: workflow.phase,
+        hasWallets: Boolean(workflow.wallets?.length)
+      },
+      error: workflow.error,
+      message: workflow.phase,
+      createdAt: workflow.createdAt,
+      updatedAt: workflow.updatedAt
+    };
+  }
 }
 
 class WithdrawInputParser {
@@ -174,12 +203,20 @@ class WithdrawInputParser {
 export class TokenAutomationApp {
   private readonly orders = new OrderRepository();
   private readonly tokenLaunches = new TokenLaunchRepository();
+  private readonly workflows = new WorkflowRepository();
   private readonly gmailStore = new GmailRepository();
   private readonly verificationStore = new VerificationRepository();
   private readonly gmail = new GmailService(this.gmailStore);
-  private readonly activity = new ActivityFeed(this.verificationStore, this.tokenLaunches);
+  private readonly activity = new ActivityFeed(this.verificationStore, this.tokenLaunches, this.workflows);
   private readonly tokenLaunch = new TokenLaunchService(this.tokenLaunches, (job, event) =>
     this.io.to('dashboards').emit(`tokenlaunch:${event}`, { job })
+  );
+  private readonly launchWorkflow = new LaunchWorkflowService(
+    this.workflows,
+    this.tokenLaunch,
+    async (extensionId, input) => this.submitWithdrawOrder(extensionId, input),
+    (orderId) => this.orders.get(orderId),
+    (workflow, event) => this.io.to('dashboards').emit(`workflow:${event}`, { workflow })
   );
   private readonly totp = new TotpAuthenticator();
   private readonly extensions = new Map<string, ExtensionRecord>();
@@ -200,11 +237,13 @@ export class TokenAutomationApp {
     app.use('/api/gmails', this.gmailRoutes());
     app.use('/api/verification-requests', this.verificationRoutes());
     app.use('/api/tokenlaunch', this.tokenLaunchRoutes());
+    app.use('/api/workflows', this.workflowRoutes());
     this.coreRoutes(app);
 
     this.io.on('connection', (socket) => this.onSocket(socket));
 
     this.httpServer.listen(PORT, () => {
+      networkTime.startBackgroundSync();
       this.gmail.startSyncLoop();
       this.flushExpiredOrders();
       setInterval(() => this.flushExpiredOrders(), 15_000);
@@ -295,6 +334,37 @@ export class TokenAutomationApp {
       }
     });
 
+    router.get('/:jobId/trades', async (req, res) => {
+      try {
+        const refresh = req.query.refresh === 'true' || req.query.refresh === '1';
+        const data = await this.tokenLaunch.getTrades(req.params.jobId, refresh);
+        res.json({ success: true, data });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to load trades';
+        const status = message.includes('not found')
+          ? 404
+          : message.includes('not available')
+            ? 409
+            : message.includes('must be set')
+              ? 503
+              : 500;
+        res.status(status).json({ success: false, error: message });
+      }
+    });
+
+    router.post('/trades/backfill', async (req, res) => {
+      try {
+        const body = req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
+        const onlyMissing = body.onlyMissing !== false;
+        const data = await this.tokenLaunch.backfillAllTrades({ onlyMissing });
+        res.json({ success: true, data });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Trades backfill failed';
+        const status = message.includes('already running') ? 409 : message.includes('must be set') ? 503 : 500;
+        res.status(status).json({ success: false, error: message });
+      }
+    });
+
     router.post('/lp/remove', async (req, res) => {
       try {
         const body = req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
@@ -368,6 +438,66 @@ export class TokenAutomationApp {
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Invalid token launch request';
         const status = message.includes('already running') ? 409 : message.includes('must be set') ? 503 : 400;
+        res.status(status).json({ success: false, error: message });
+      }
+    });
+
+    return router;
+  }
+
+  private workflowRoutes(): Router {
+    const router = Router();
+
+    router.get('/', (_req, res) => {
+      res.json({ success: true, data: this.launchWorkflow.list() });
+    });
+
+    router.get('/:workflowId', (req, res) => {
+      const workflow = this.launchWorkflow.get(req.params.workflowId);
+      if (!workflow) {
+        res.status(404).json({ success: false, error: 'Launch workflow not found' });
+        return;
+      }
+      res.json({ success: true, data: workflow });
+    });
+
+    router.post('/', (req, res) => {
+      try {
+        const workflow = this.launchWorkflow.start(LaunchWorkflowInputParser.parse(req.body));
+        res.status(201).json({ success: true, data: workflow });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Invalid launch workflow request';
+        const status = message.includes('already running') ? 409 : 400;
+        res.status(status).json({ success: false, error: message });
+      }
+    });
+
+    router.post('/:workflowId/cancel', (req, res) => {
+      try {
+        const workflow = this.launchWorkflow.cancel(req.params.workflowId);
+        res.json({ success: true, data: workflow });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to cancel workflow';
+        const status = message.includes('not found')
+          ? 404
+          : message.includes('Only active')
+            ? 409
+            : 400;
+        res.status(status).json({ success: false, error: message });
+      }
+    });
+
+    router.post('/:workflowId/deposit', async (req, res) => {
+      try {
+        const workflow = await this.launchWorkflow.deposit(req.params.workflowId);
+        res.json({ success: true, data: workflow });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to deposit workflow funds';
+        const status = message.includes('not found')
+          ? 404
+          : message.includes('still running') || message.includes('already in progress')
+            ? 409
+            : 400;
         res.status(status).json({ success: false, error: message });
       }
     });
@@ -499,6 +629,7 @@ export class TokenAutomationApp {
         extensions: this.listExtensions(),
         orders: this.orders.list(),
         tokenLaunches: this.tokenLaunch.list(),
+        workflows: this.launchWorkflow.list(),
         activity: this.activity.build(this.orders.list())
       });
     });
@@ -559,13 +690,13 @@ export class TokenAutomationApp {
 
     socket.on(
       'extension:request_authenticator_code',
-      (ack?: (r: { success: boolean; authenticatorCode?: string; error?: string }) => void) => {
+      async (ack?: (r: { success: boolean; authenticatorCode?: string; error?: string }) => void) => {
         if (!socket.data.extensionId) {
           ack?.({ success: false, error: 'Extension is not registered' });
           return;
         }
         try {
-          ack?.({ success: true, authenticatorCode: this.totp.generate() });
+          ack?.({ success: true, authenticatorCode: await this.totp.generate() });
         } catch (error) {
           ack?.({ success: false, error: error instanceof Error ? error.message : 'Failed to generate authenticator code' });
         }
@@ -646,19 +777,35 @@ export class TokenAutomationApp {
   }
 
   private createOrder(extensionId: string, input: WithdrawRequest, res?: Response): AutomationOrder | null {
+    try {
+      return this.submitWithdrawOrder(extensionId, input, res);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to create order';
+      res?.status(409).json({ success: false, error: message });
+      if (!res) throw error instanceof Error ? error : new Error(message);
+      return null;
+    }
+  }
+
+  private submitWithdrawOrder(extensionId: string, input: WithdrawRequest, res?: Response): AutomationOrder {
     this.flushExpiredOrders();
     const id = extensionId.trim();
     if (!this.extensions.has(id)) {
-      res?.status(404).json({ success: false, error: `Extension ${id} is not connected` });
-      return null;
+      if (res) {
+        res.status(404).json({ success: false, error: `Extension ${id} is not connected` });
+        return null as unknown as AutomationOrder;
+      }
+      throw new Error(`Extension ${id} is not connected`);
     }
 
     const active = this.orders.findActiveForExtension(id);
     if (active) {
       const message = 'Extension already has a running order';
-      res?.status(409).json({ success: false, error: message });
-      if (!res) throw new Error(message);
-      return null;
+      if (res) {
+        res.status(409).json({ success: false, error: message });
+        return null as unknown as AutomationOrder;
+      }
+      throw new Error(message);
     }
 
     const order = this.orders.create(id, input);
@@ -672,12 +819,17 @@ export class TokenAutomationApp {
         error: 'Extension disconnected before order could run'
       });
       if (failed) this.broadcastOrder(failed);
-      res?.status(409).json({ success: false, error: 'Extension disconnected before order could run', data: failed });
-      return null;
+      if (res) {
+        res.status(409).json({ success: false, error: 'Extension disconnected before order could run', data: failed });
+        return null as unknown as AutomationOrder;
+      }
+      throw new Error('Extension disconnected before order could run');
     }
 
     const executing = this.orders.markExecuting(order.orderId);
-    if (!executing) return null;
+    if (!executing) {
+      throw new Error('Failed to mark order as executing');
+    }
 
     socket.emit('extension:run_order', { orderId: executing.orderId, ...executing.input });
     this.broadcastOrder(executing);

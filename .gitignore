@@ -3,4 +3,7 @@
 **/.vite/
 *.log
 .env
-backend/data/gmail-accounts.json
+backend/data/*.db
+backend/data/*.db-wal
+backend/data/*.db-shm
+backend/data/*.migrated

@@ -1,6 +1,62 @@
 export type OrderStatus = 'pending' | 'executing' | 'completed' | 'failed' | 'cancelled';
 export type VerificationRequestStatus = 'pending' | 'completed' | 'failed';
-export type ActivityKind = 'withdraw' | 'email_verification' | 'token_launch';
+export type ActivityKind = 'withdraw' | 'email_verification' | 'token_launch' | 'launch_workflow';
+
+export type LaunchWorkflowStatus =
+  | 'pending'
+  | 'creating_wallets'
+  | 'withdrawing'
+  | 'waiting_funds'
+  | 'launching'
+  | 'analyzing'
+  | 'depositing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface StoredWorkflowWallet {
+  index: 1 | 2 | 3;
+  address: string;
+  privateKey: string;
+}
+
+export interface LaunchWorkflowInput {
+  extensionId: string;
+  /** 2 = deploy + buy wallets; 3 = adds a third buy wallet */
+  walletCount: 2 | 3;
+  autoStartLaunch: boolean;
+  analyzeOnComplete: boolean;
+  wallet1WithdrawAmount?: string;
+  wallet2WithdrawAmount?: string;
+  wallet3WithdrawAmount?: string;
+  tokenLaunch: TokenLaunchInput;
+}
+
+export interface LaunchWorkflowPublicWallet {
+  index: 1 | 2 | 3;
+  address: string;
+}
+
+export interface LaunchWorkflow {
+  workflowId: string;
+  status: LaunchWorkflowStatus;
+  phase?: string;
+  input: LaunchWorkflowInput;
+  wallets?: LaunchWorkflowPublicWallet[];
+  withdrawOrderIds?: string[];
+  launchJobId?: string;
+  depositTxHashes?: string[];
+  analysis?: TokenLaunchTradesResponse;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+/** Internal persisted record — includes private keys for crash recovery */
+export interface LaunchWorkflowRecord extends LaunchWorkflow {
+  storedWallets?: StoredWorkflowWallet[];
+}
 
 export type TokenLaunchStatus =
   | 'pending'
@@ -33,6 +89,46 @@ export interface TokenLaunchInput {
   minBuyersBeforeRemoveLp: number;
 }
 
+export type PoolTradeSide = 'buy' | 'sell';
+
+export interface PoolTrade {
+  logIndex: number;
+  txHash: string;
+  blockNumber: number;
+  timestamp: string;
+  side: PoolTradeSide;
+  trader: string;
+  tokenAmount: string;
+  ethAmount: string;
+  tokenAmountFormatted: string;
+  ethAmountFormatted: string;
+  isOwnWallet: boolean;
+}
+
+export interface LaunchTradeStats {
+  totalSwaps: number;
+  buys: number;
+  sells: number;
+  externalBuyers: number;
+  externalSellers: number;
+  ownWalletSwaps: number;
+}
+
+export interface TokenLaunchTradesResponse {
+  jobId: string;
+  tokenAddress: string;
+  poolAddress: string;
+  trades: PoolTrade[];
+  stats: LaunchTradeStats;
+  tradesSyncedAt?: string;
+}
+
+export interface TokenLaunchTradesBackfillResult {
+  processed: number;
+  skipped: number;
+  failed: { jobId: string; error: string }[];
+}
+
 export interface TokenLaunchJob {
   jobId: string;
   status: TokenLaunchStatus;
@@ -41,6 +137,9 @@ export interface TokenLaunchJob {
   repeatTotal?: number;
   tokenAddress?: string;
   poolAddress?: string;
+  deployBlockNumber?: number;
+  trades?: PoolTrade[];
+  tradesSyncedAt?: string;
   deployTxHash?: string;
   addLiquidityTxHash?: string;
   buyTxHash?: string;
@@ -200,6 +299,13 @@ export interface ActivityItem {
     poolAddress?: string;
     buyerCount?: number;
     phase?: string;
+  };
+  launchWorkflow?: {
+    walletCount: 2 | 3;
+    autoStartLaunch: boolean;
+    launchJobId?: string;
+    phase?: string;
+    hasWallets?: boolean;
   };
   createdAt: string;
   updatedAt: string;

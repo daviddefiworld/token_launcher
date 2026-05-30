@@ -339,3 +339,68 @@ h2 {
   font-size: 14px;
   margin: 10px 0 0;
 }
+
+.analyzer-stats {
+  margin-bottom: 28px;
+}
+
+.analyzer-stat-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+}
+
+.analyzer-stat-label {
+  color: #64748b;
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.analyzer-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.analyzer-filters label {
+  color: #334155;
+  display: grid;
+  font-size: 12px;
+  font-weight: 700;
+  gap: 4px;
+}
+
+.analyzer-filters select {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  font: inherit;
+  min-width: 120px;
+  padding: 6px 8px;
+}
+
+.trade-table-wrap {
+  margin-top: 12px;
+  overflow-x: auto;
+}
+
+.trade-table {
+  border-collapse: collapse;
+  font-size: 13px;
+  width: 100%;
+}
+
+.trade-table th,
+.trade-table td {
+  border-bottom: 1px solid #e2e8f0;
+  padding: 10px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.trade-table th {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+}

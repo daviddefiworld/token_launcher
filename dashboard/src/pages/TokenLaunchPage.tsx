@@ -553,6 +553,14 @@ export function TokenLaunchPage({
                     )}
                   </div>
                 )}
+                {job.tokenAddress && job.poolAddress && (
+                  <p style={{ marginTop: 10 }}>
+                    <Link to={`/tokenlaunch/${job.jobId}`} className="back-link" style={{ marginBottom: 0 }}>
+                      View analyzer
+                      {job.trades && job.trades.length > 0 ? ` (${job.trades.length} trades)` : ''}
+                    </Link>
+                  </p>
+                )}
                 {job.tokenAddress && (
                   <p className="subtle mono">
                     Token:{' '}

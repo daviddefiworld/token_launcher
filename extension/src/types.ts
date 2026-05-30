@@ -1,3 +1,10 @@
+export const TOKEN_AUTOMATION_PORT = 'tokenAutomation';
+
+export const RUNTIME_MSG = {
+  progress: 'tokenAutomationProgress',
+  result: 'tokenAutomationResult'
+} as const;
+
 export interface TokenAutomationMessage {
   type?: string;
   orderId?: string;
@@ -22,6 +29,19 @@ export interface AutomationResponse {
   emailCodeSent?: boolean;
   emailCodeSentAt?: number;
   emailCode?: string;
+}
+
+export interface AutomationProgressMessage {
+  type: typeof RUNTIME_MSG.progress;
+  orderId: string;
+  message?: string;
+}
+
+export interface AutomationResultMessage {
+  type: typeof RUNTIME_MSG.result;
+  orderId: string;
+  ok: boolean;
+  response: AutomationResponse;
 }
 
 export type FillableElement = HTMLInputElement | HTMLTextAreaElement;

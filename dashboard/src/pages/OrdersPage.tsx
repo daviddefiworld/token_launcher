@@ -1,12 +1,13 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { cancelOrder } from '../api';
+import { cancelOrder, depositLaunchWorkflow } from '../api';
 import type { ActivityItem, AutomationOrder } from '../types';
-import { formatDuration, formatUtcTime, isActiveOrderStatus, shortId } from '../utils';
+import { canDepositWorkflowActivity, formatDuration, formatUtcTime, isActiveOrderStatus, shortId } from '../utils';
 
 function kindLabel(kind: ActivityItem['kind']): string {
   if (kind === 'email_verification') return 'Email check';
   if (kind === 'token_launch') return 'Token launch';
+  if (kind === 'launch_workflow') return 'Launch workflow';
   return 'Withdraw';
 }
 
@@ -29,7 +30,9 @@ export function OrdersPage({
 }) {
   const [filter, setFilter] = useState<'all' | ActivityItem['kind']>('all');
   const [cancelBusy, setCancelBusy] = useState<string | null>(null);
+  const [depositBusy, setDepositBusy] = useState<string | null>(null);
   const [cancelError, setCancelError] = useState<string | null>(null);
+  const [depositError, setDepositError] = useState<string | null>(null);
   const filtered = filter === 'all' ? activity : activity.filter((item) => item.kind === filter);
 
   const handleCancel = async (orderId: string) => {
@@ -42,6 +45,19 @@ export function OrdersPage({
       setCancelError(err instanceof Error ? err.message : 'Failed to cancel order');
     } finally {
       setCancelBusy(null);
+    }
+  };
+
+  const handleDeposit = async (workflowId: string) => {
+    setDepositBusy(workflowId);
+    setDepositError(null);
+    try {
+      await depositLaunchWorkflow(workflowId);
+      reload();
+    } catch (err) {
+      setDepositError(err instanceof Error ? err.message : 'Failed to deposit workflow funds');
+    } finally {
+      setDepositBusy(null);
     }
   };
 
@@ -85,7 +101,7 @@ export function OrdersPage({
         </button>
       </div>
 
-      {cancelError && <p className="error">{cancelError}</p>}
+      {(cancelError || depositError) && <p className="error">{cancelError || depositError}</p>}
 
       {loading ? (
         <div className="empty">Loading orders...</div>
@@ -129,6 +145,18 @@ export function OrdersPage({
                     onClick={() => void handleCancel(item.id)}
                   >
                     {cancelBusy === item.id ? 'Cancelling...' : 'Cancel withdraw'}
+                  </button>
+                </div>
+              )}
+              {canDepositWorkflowActivity(item) && (
+                <div className="button-row" style={{ marginTop: 12 }}>
+                  <button
+                    type="button"
+                    className="button secondary"
+                    disabled={depositBusy === item.id || Boolean(depositBusy)}
+                    onClick={() => void handleDeposit(item.id)}
+                  >
+                    {depositBusy === item.id ? 'Depositing...' : 'Deposit to exchange'}
                   </button>
                 </div>
               )}

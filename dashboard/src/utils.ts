@@ -1,5 +1,5 @@
 import { getOrders } from './api';
-import type { ActivityItem, AutomationOrder, TokenLaunchJob, VerificationCodeRequest } from './types';
+import type { ActivityItem, AutomationOrder, LaunchWorkflow, LaunchWorkflowStatus, TokenLaunchJob, VerificationCodeRequest } from './types';
 
 export const ORDER_CANCELLED_MESSAGE = 'Order cancelled';
 
@@ -107,6 +107,26 @@ export function isActiveOrderStatus(status: AutomationOrder['status']): boolean 
   return ACTIVE_ORDER_STATUSES.has(status);
 }
 
+const WORKFLOW_DEPOSIT_BLOCKING_STATUSES = new Set<LaunchWorkflowStatus>([
+  'pending',
+  'creating_wallets',
+  'withdrawing',
+  'waiting_funds',
+  'launching',
+  'analyzing'
+]);
+
+export function canDepositWorkflow(workflow: Pick<LaunchWorkflow, 'status' | 'wallets'>): boolean {
+  if (!workflow.wallets?.length) return false;
+  return !WORKFLOW_DEPOSIT_BLOCKING_STATUSES.has(workflow.status);
+}
+
+export function canDepositWorkflowActivity(item: ActivityItem): boolean {
+  if (item.kind !== 'launch_workflow') return false;
+  if (!item.launchWorkflow?.hasWallets) return false;
+  return !WORKFLOW_DEPOSIT_BLOCKING_STATUSES.has(item.status as LaunchWorkflowStatus);
+}
+
 export function formatDuration(ms: number | undefined): string | null {
   if (ms === undefined || !Number.isFinite(ms)) return null;
   if (ms < 1000) return `${ms}ms`;
@@ -195,6 +215,28 @@ export class ActivityMapper {
       message: job.phase,
       createdAt: job.createdAt,
       updatedAt: job.updatedAt
+    };
+  }
+
+  static fromLaunchWorkflow(workflow: LaunchWorkflow): ActivityItem {
+    return {
+      id: workflow.workflowId,
+      kind: 'launch_workflow',
+      extensionId: workflow.input.extensionId,
+      status: workflow.status,
+      title: `Launch workflow: ${workflow.input.tokenLaunch.tokenName}`,
+      summary: `${workflow.input.walletCount} wallets · ${workflow.phase || workflow.status}`,
+      launchWorkflow: {
+        walletCount: workflow.input.walletCount,
+        autoStartLaunch: workflow.input.autoStartLaunch,
+        launchJobId: workflow.launchJobId,
+        phase: workflow.phase,
+        hasWallets: Boolean(workflow.wallets?.length)
+      },
+      error: workflow.error,
+      message: workflow.phase,
+      createdAt: workflow.createdAt,
+      updatedAt: workflow.updatedAt
     };
   }
 }

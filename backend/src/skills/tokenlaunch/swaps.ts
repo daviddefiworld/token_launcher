@@ -1,0 +1,237 @@
+import { decodeEventLog, formatEther, getAddress, type Address } from 'viem';
+import type { LaunchTradeStats, PoolTrade } from '../../types';
+
+export type { LaunchTradeStats };
+import { aerodromePoolAbi } from './config';
+
+const LOG_CHUNK_BLOCKS = 2_000n;
+const CHUNK_DELAY_MS = 400;
+
+export function tradeKey(trade: PoolTrade): string {
+  return `${trade.txHash}:${trade.logIndex}`;
+}
+
+export function mergeTrades(existing: PoolTrade[], incoming: PoolTrade[]): PoolTrade[] {
+  const map = new Map<string, PoolTrade>();
+  for (const trade of [...existing, ...incoming]) {
+    map.set(tradeKey(trade), trade);
+  }
+  return [...map.values()].sort(
+    (a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex
+  );
+}
+
+export function countExternalBuyersFromTrades(trades: PoolTrade[]): number {
+  const buyers = new Set<string>();
+  for (const trade of trades) {
+    if (trade.side === 'buy' && !trade.isOwnWallet) {
+      buyers.add(trade.trader.toLowerCase());
+    }
+  }
+  return buyers.size;
+}
+
+export function computeTradeStats(trades: PoolTrade[]): LaunchTradeStats {
+  const externalBuyers = new Set<string>();
+  const externalSellers = new Set<string>();
+  let buys = 0;
+  let sells = 0;
+  let ownWalletSwaps = 0;
+
+  for (const trade of trades) {
+    if (trade.side === 'buy') buys += 1;
+    else sells += 1;
+    if (trade.isOwnWallet) ownWalletSwaps += 1;
+    else if (trade.side === 'buy') externalBuyers.add(trade.trader.toLowerCase());
+    else externalSellers.add(trade.trader.toLowerCase());
+  }
+
+  return {
+    totalSwaps: trades.length,
+    buys,
+    sells,
+    externalBuyers: externalBuyers.size,
+    externalSellers: externalSellers.size,
+    ownWalletSwaps
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resolveTrader(
+  sender: Address,
+  to: Address,
+  ourWallets: Set<string>
+): { trader: Address; isOwnWallet: boolean } {
+  const senderLower = sender.toLowerCase();
+  const toLower = to.toLowerCase();
+  const senderOurs = ourWallets.has(senderLower);
+  const toOurs = ourWallets.has(toLower);
+
+  if (!senderOurs && !toOurs) {
+    return { trader: getAddress(to), isOwnWallet: false };
+  }
+  if (!senderOurs) return { trader: getAddress(sender), isOwnWallet: false };
+  if (!toOurs) return { trader: getAddress(to), isOwnWallet: false };
+  return { trader: getAddress(sender), isOwnWallet: true };
+}
+
+type RawSwapLog = {
+  blockNumber: bigint;
+  transactionHash: `0x${string}`;
+  logIndex: number;
+  data: `0x${string}`;
+  topics: [] | [`0x${string}`, ...`0x${string}`[]];
+};
+
+function decodeSwapLog(
+  log: RawSwapLog,
+  tokenIs0: boolean,
+  ourWallets: Set<string>,
+  blockTimestamps: Map<number, string>
+): PoolTrade | null {
+  const decoded = decodeEventLog({
+    abi: aerodromePoolAbi,
+    data: log.data,
+    topics: log.topics
+  });
+  if (decoded.eventName !== 'Swap') return null;
+
+  const { sender, to, amount0In, amount1In, amount0Out, amount1Out } = decoded.args as {
+    sender: Address;
+    to: Address;
+    amount0In: bigint;
+    amount1In: bigint;
+    amount0Out: bigint;
+    amount1Out: bigint;
+  };
+
+  const boughtToken = tokenIs0
+    ? amount0Out > 0n && amount1In > 0n
+    : amount1Out > 0n && amount0In > 0n;
+  const soldToken = tokenIs0
+    ? amount0In > 0n && amount1Out > 0n
+    : amount1In > 0n && amount0Out > 0n;
+
+  if (!boughtToken && !soldToken) return null;
+
+  const side: PoolTrade['side'] = boughtToken ? 'buy' : 'sell';
+  const tokenAmount = tokenIs0
+    ? side === 'buy'
+      ? amount0Out
+      : amount0In
+    : side === 'buy'
+      ? amount1Out
+      : amount1In;
+  const ethAmount = tokenIs0
+    ? side === 'buy'
+      ? amount1In
+      : amount1Out
+    : side === 'buy'
+      ? amount0In
+      : amount0Out;
+
+  const { trader, isOwnWallet } = resolveTrader(sender, to, ourWallets);
+  const blockNumber = Number(log.blockNumber);
+
+  return {
+    logIndex: log.logIndex,
+    txHash: log.transactionHash,
+    blockNumber,
+    timestamp: blockTimestamps.get(blockNumber) ?? '',
+    side,
+    trader,
+    tokenAmount: tokenAmount.toString(),
+    ethAmount: ethAmount.toString(),
+    ethAmountFormatted: formatEther(ethAmount),
+    tokenAmountFormatted: formatEther(tokenAmount),
+    isOwnWallet
+  };
+}
+
+type PublicClientLike = {
+  readContract: (args: unknown) => Promise<unknown>;
+  getLogs: (args: unknown) => Promise<unknown[]>;
+  getBlockNumber: () => Promise<bigint>;
+  getBlock: (args: { blockNumber: bigint }) => Promise<{ timestamp: bigint }>;
+  getTransactionReceipt: (args: { hash: `0x${string}` }) => Promise<{ blockNumber: bigint } | null>;
+};
+
+export async function fetchPoolTrades(
+  client: PublicClientLike,
+  poolAddress: Address,
+  tokenAddress: Address,
+  fromBlock: bigint,
+  ourWallets: Set<string>,
+  onChunk?: (trades: PoolTrade[]) => void
+): Promise<PoolTrade[]> {
+  const token0 = (await client.readContract({
+    address: poolAddress,
+    abi: aerodromePoolAbi,
+    functionName: 'token0'
+  })) as Address;
+  const tokenIs0 = getAddress(token0) === getAddress(tokenAddress);
+
+  const latest = await client.getBlockNumber();
+  const start = fromBlock > latest ? latest : fromBlock;
+  const allLogs: RawSwapLog[] = [];
+
+  for (let chunkStart = start; chunkStart <= latest; chunkStart += LOG_CHUNK_BLOCKS + 1n) {
+    const chunkEnd =
+      chunkStart + LOG_CHUNK_BLOCKS > latest ? latest : chunkStart + LOG_CHUNK_BLOCKS;
+    const logs = (await client.getLogs({
+      address: poolAddress,
+      event: aerodromePoolAbi[0],
+      fromBlock: chunkStart,
+      toBlock: chunkEnd
+    })) as RawSwapLog[];
+    allLogs.push(...logs);
+    if (chunkEnd < latest) await sleep(CHUNK_DELAY_MS);
+  }
+
+  const blockNumbers = [...new Set(allLogs.map((log) => Number(log.blockNumber)))];
+  const blockTimestamps = new Map<number, string>();
+  for (const blockNumber of blockNumbers) {
+    const block = await client.getBlock({ blockNumber: BigInt(blockNumber) });
+    blockTimestamps.set(blockNumber, new Date(Number(block.timestamp) * 1000).toISOString());
+  }
+
+  const trades: PoolTrade[] = [];
+  for (const log of allLogs) {
+    const trade = decodeSwapLog(log, tokenIs0, ourWallets, blockTimestamps);
+    if (trade) trades.push(trade);
+  }
+
+  trades.sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex);
+  if (onChunk) onChunk(trades);
+  return trades;
+}
+
+export async function resolveFromBlock(
+  client: PublicClientLike,
+  deployTxHash: `0x${string}` | undefined,
+  deployBlockNumber: number | undefined,
+  sinceMs: number
+): Promise<bigint> {
+  if (deployBlockNumber !== undefined && deployBlockNumber >= 0) {
+    return BigInt(deployBlockNumber);
+  }
+  if (deployTxHash) {
+    const receipt = await client.getTransactionReceipt({ hash: deployTxHash });
+    if (receipt?.blockNumber !== undefined) return receipt.blockNumber;
+  }
+  return blockNearTimestamp(client, sinceMs);
+}
+
+async function blockNearTimestamp(client: PublicClientLike, timestampMs: number): Promise<bigint> {
+  const latest = await client.getBlockNumber();
+  const latestBlock = await client.getBlock({ blockNumber: latest });
+  const latestTs = Number(latestBlock.timestamp) * 1000;
+  if (timestampMs >= latestTs) return latest;
+
+  const secondsAgo = Math.max(0, Math.floor((latestTs - timestampMs) / 1000));
+  const estimatedBlocks = BigInt(Math.min(Number(latest), Math.max(1, Math.ceil(secondsAgo / 2))));
+  return latest > estimatedBlocks ? latest - estimatedBlocks : 0n;
+}

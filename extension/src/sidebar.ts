@@ -1,12 +1,18 @@
 import { io, Socket } from 'socket.io-client';
+import { RUNTIME_MSG, TOKEN_AUTOMATION_PORT } from './types';
+import type { AutomationProgressMessage, AutomationResultMessage } from './types';
 
 const DEFAULT_BACKEND_URL = 'http://localhost:5050';
 const BITUNIX_WITHDRAW_URL = 'https://www.bitunix.com/assets/withdraw';
 const BITUNIX_WALLET_URL = 'https://www.bitunix.com/assets/overview';
-const POST_SUCCESS_WALLET_DELAY_MS = 5_000;
-const ORDER_TIMEOUT_MS = 5 * 60 * 1000;
+const POST_SUCCESS_WALLET_DELAY_MS = 120_000;
+const POST_ORDER_SETTLE_MS = 4_000;
+const ORDER_TIMEOUT_MS = 20 * 60 * 1000;
 const SLOW_PAGE_TIMEOUT_MS = 60000;
 const EMAIL_CODE_WAIT_TIMEOUT_MS = 190000;
+const WITHDRAW_ORDER_MAX_ATTEMPTS = 3;
+const WITHDRAW_RETRY_DELAY_MS = 5000;
+const WITHDRAW_PROGRESS_TIMEOUT_MS = 2 * 60 * 1000;
 const STORAGE_KEYS = {
   backendUrl: 'tokenAutomationBackendUrl',
   extensionId: 'tokenAutomationExtensionId'
@@ -47,8 +53,12 @@ let lastBitunixTabId: number | undefined;
 const orderQueue: RunOrderPayload[] = [];
 const cancelledOrderIds = new Set<string>();
 let drainingOrderQueue = false;
+let postOrderWalletTimer: number | undefined;
 
 const ORDER_CANCELLED_MESSAGE = 'Order cancelled';
+const CONTENT_TRANSPORT_RETRIES = 2;
+
+type ContentMessageType = 'tokenAutomationOrder' | 'tokenAutomationCompleteVerification' | 'tokenAutomationPrepare';
 
 const backendInput = document.getElementById('backend-url') as HTMLInputElement;
 const saveButton = document.getElementById('save-backend') as HTMLButtonElement;
@@ -276,15 +286,52 @@ function isBitunixWithdrawUrl(url: string | undefined): boolean {
   }
 }
 
-async function ensureWithdrawTab(tab: chrome.tabs.Tab): Promise<chrome.tabs.Tab> {
+function formatMessagingError(message: string | undefined): string {
+  if (!message) {
+    return 'Content script disconnected before the withdraw finished';
+  }
+  if (/message (?:port|channel) closed before a response was received/i.test(message)) {
+    return 'Bitunix withdraw page reloaded or navigated while automation was running';
+  }
+  if (/Could not establish connection/i.test(message)) {
+    return 'Content script is not loaded on the Bitunix tab. Open bitunix.com and reload the extension.';
+  }
+  return message;
+}
+
+function cancelPostOrderWalletNavigation(): void {
+  if (postOrderWalletTimer !== undefined) {
+    window.clearTimeout(postOrderWalletTimer);
+    postOrderWalletTimer = undefined;
+  }
+}
+
+async function reloadWithdrawPage(tabId: number): Promise<void> {
+  setMessage('Refreshing Bitunix withdraw page...');
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      window.location.reload();
+    }
+  });
+  await waitForTabComplete(tabId);
+  await waitForWithdrawPageReady(tabId);
+}
+
+async function ensureWithdrawTab(tab: chrome.tabs.Tab, options?: { reload?: boolean }): Promise<chrome.tabs.Tab> {
   if (!tab.id) {
     throw new Error('No active tab found');
   }
 
-  if (isBitunixWithdrawUrl(tab.url)) {
-    await updateTab(tab.id, { active: true });
+  const current = await getTab(tab.id);
+  if (isBitunixWithdrawUrl(current.url)) {
+    if (options?.reload) {
+      await reloadWithdrawPage(tab.id);
+    } else {
+      await waitForWithdrawPageReady(tab.id);
+    }
     lastBitunixTabId = tab.id;
-    return tab;
+    return getTab(tab.id);
   }
 
   setMessage('Opening Bitunix withdraw page...');
@@ -294,32 +341,260 @@ async function ensureWithdrawTab(tab: chrome.tabs.Tab): Promise<chrome.tabs.Tab>
   return getTab(tab.id);
 }
 
-function sendToContent(
+function sendQuickContentCommand(
   tabId: number,
-  type: 'tokenAutomationOrder' | 'tokenAutomationCompleteVerification',
+  type: 'tokenAutomationPrepare',
   payload: Partial<RunOrderPayload> = {}
 ): Promise<ContentOrderResponse> {
   return new Promise((resolve, reject) => {
-    chrome.tabs.sendMessage(
-      tabId,
-      {
-        ...payload,
-        type,
-        text: payload.text || 'Bitunix withdraw'
-      },
-      (response: ContentOrderResponse | undefined) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
+    let settled = false;
+    let port: chrome.runtime.Port | null = null;
+
+    const finish = (handler: () => void) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      handler();
+    };
+
+    const timeoutId = window.setTimeout(() => {
+      try {
+        port?.disconnect();
+      } catch {
+        // ignore
+      }
+      finish(() => reject(new Error('Timed out preparing withdraw page')));
+    }, SLOW_PAGE_TIMEOUT_MS);
+
+    try {
+      port = chrome.tabs.connect(tabId, { name: TOKEN_AUTOMATION_PORT });
+    } catch (error) {
+      finish(() =>
+        reject(new Error(formatMessagingError(error instanceof Error ? error.message : 'Could not connect to page')))
+      );
+      return;
+    }
+
+    port.onMessage.addListener((message: { ok?: boolean; response?: ContentOrderResponse }) => {
+      const response = message.response;
+      finish(() => {
+        try {
+          port?.disconnect();
+        } catch {
+          // ignore
         }
-        if (!response?.success) {
-          reject(new Error(response?.error || 'Content script did not complete the order'));
+        if (!message.ok || !response?.success) {
+          reject(new Error(response?.error || 'Content script did not prepare the page'));
           return;
         }
         resolve(response);
-      }
-    );
+      });
+    });
+
+    port.onDisconnect.addListener(() => {
+      if (settled) return;
+      finish(() => reject(new Error(formatMessagingError(chrome.runtime.lastError?.message))));
+    });
+
+    port.postMessage({
+      ...payload,
+      type,
+      text: payload.text || 'Bitunix withdraw'
+    });
   });
+}
+
+function waitForContentResult(orderId: string, onProgress?: (message: string) => void): Promise<ContentOrderResponse> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeoutId = 0;
+    let lastProgressAt = Date.now();
+    let watchdogId = 0;
+
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      window.clearInterval(watchdogId);
+      chrome.runtime.onMessage.removeListener(onRuntimeMessage);
+    };
+
+    const resetTimeout = () => {
+      window.clearTimeout(timeoutId);
+      timeoutId = window.setTimeout(() => {
+        cleanup();
+        reject(new Error('Timed out waiting for Bitunix automation in the page'));
+      }, WITHDRAW_PROGRESS_TIMEOUT_MS);
+    };
+
+    const onRuntimeMessage = (message: AutomationProgressMessage | AutomationResultMessage) => {
+      if (!message?.type || message.orderId !== orderId) return;
+
+      if (message.type === RUNTIME_MSG.progress) {
+        lastProgressAt = Date.now();
+        resetTimeout();
+        if (message.message) onProgress?.(message.message);
+        return;
+      }
+
+      if (message.type === RUNTIME_MSG.result) {
+        cleanup();
+        if (message.ok && message.response?.success) {
+          resolve(message.response);
+          return;
+        }
+        reject(new Error(message.response?.error || 'Content script did not complete the order'));
+      }
+    };
+
+    chrome.runtime.onMessage.addListener(onRuntimeMessage);
+    resetTimeout();
+
+    watchdogId = window.setInterval(() => {
+      if (settled) return;
+      if (Date.now() - lastProgressAt > ORDER_TIMEOUT_MS) {
+        cleanup();
+        reject(new Error('Timed out waiting for Bitunix automation in the page'));
+      }
+    }, 30_000);
+  });
+}
+
+function sendLongRunningContentCommand(
+  tabId: number,
+  type: Exclude<ContentMessageType, 'tokenAutomationPrepare'>,
+  payload: Partial<RunOrderPayload> = {}
+): Promise<ContentOrderResponse> {
+  const orderId = payload.orderId?.trim();
+  if (!orderId) {
+    return Promise.reject(new Error('orderId is required'));
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let port: chrome.runtime.Port | null = null;
+    let accepted = false;
+
+    const finish = (handler: () => void) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(connectTimeoutId);
+      handler();
+    };
+
+    const connectTimeoutId = window.setTimeout(() => {
+      if (accepted) return;
+      try {
+        port?.disconnect();
+      } catch {
+        // ignore
+      }
+      finish(() => reject(new Error('Timed out connecting to Bitunix page for withdraw')));
+    }, SLOW_PAGE_TIMEOUT_MS);
+
+    try {
+      port = chrome.tabs.connect(tabId, { name: TOKEN_AUTOMATION_PORT });
+    } catch (error) {
+      finish(() =>
+        reject(new Error(formatMessagingError(error instanceof Error ? error.message : 'Could not connect to page')))
+      );
+      return;
+    }
+
+    port.onMessage.addListener((message: { ok?: boolean; accepted?: boolean; orderId?: string }) => {
+      if (!message.accepted || message.orderId !== orderId) return;
+      accepted = true;
+      window.clearTimeout(connectTimeoutId);
+      try {
+        port?.disconnect();
+      } catch {
+        // ignore
+      }
+      void waitForContentResult(orderId, (progress) => setMessage(progress)).then(
+        (response) => finish(() => resolve(response)),
+        (error) => finish(() => reject(error instanceof Error ? error : new Error(String(error))))
+      );
+    });
+
+    port.onDisconnect.addListener(() => {
+      if (settled || accepted) return;
+      finish(() => reject(new Error(formatMessagingError(chrome.runtime.lastError?.message))));
+    });
+
+    port.postMessage({
+      ...payload,
+      type,
+      text: payload.text || 'Bitunix withdraw'
+    });
+  });
+}
+
+async function ensureTabOnWithdrawPage(tabId: number): Promise<void> {
+  const tab = await getTab(tabId);
+  if (isBitunixWithdrawUrl(tab.url)) {
+    await waitForWithdrawPageReady(tabId);
+    return;
+  }
+  setMessage('Opening Bitunix withdraw page...');
+  await updateTab(tabId, { url: BITUNIX_WITHDRAW_URL, active: true });
+  await waitForWithdrawPageReady(tabId);
+}
+
+async function prepareWithdrawPage(tabId: number): Promise<void> {
+  await ensureTabOnWithdrawPage(tabId);
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= CONTENT_TRANSPORT_RETRIES; attempt += 1) {
+    if (attempt > 0) {
+      await ensureTabOnWithdrawPage(tabId);
+      await delay(1500);
+    }
+    try {
+      await sendQuickContentCommand(tabId, 'tokenAutomationPrepare');
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (!isRetryableMessagingError(lastError.message) || attempt >= CONTENT_TRANSPORT_RETRIES) {
+        throw lastError;
+      }
+    }
+  }
+  throw lastError || new Error('Content script did not prepare the page');
+}
+
+function isRetryableMessagingError(message: string): boolean {
+  return (
+    /message (?:port|channel) closed|disconnected before|Could not establish connection|Timed out waiting for Bitunix automation|Timed out connecting to Bitunix page|Timed out preparing withdraw page/i.test(
+      message
+    )
+  );
+}
+
+async function sendToContent(
+  tabId: number,
+  type: Exclude<ContentMessageType, 'tokenAutomationPrepare'>,
+  payload: Partial<RunOrderPayload> = {}
+): Promise<ContentOrderResponse> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= CONTENT_TRANSPORT_RETRIES; attempt += 1) {
+    if (attempt > 0) {
+      setMessage(`Reconnecting to Bitunix page (${attempt + 1}/${CONTENT_TRANSPORT_RETRIES + 1})...`);
+      await ensureContentScript(await getTab(tabId));
+      await reloadWithdrawPage(tabId);
+      await delay(1500);
+    }
+
+    try {
+      return await sendLongRunningContentCommand(tabId, type, payload);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (!isRetryableMessagingError(lastError.message) || attempt >= CONTENT_TRANSPORT_RETRIES) {
+        throw lastError;
+      }
+    }
+  }
+
+  throw lastError || new Error('Content script did not complete the order');
 }
 
 function showVerificationCodes(emailCode: string, authenticatorCode: string): void {
@@ -552,48 +827,80 @@ async function runOrder(payload: RunOrderPayload): Promise<void> {
   setMessage('Running Bitunix withdraw order...');
 
   let bitunixTabId: number | undefined;
+  let lastError: Error | null = null;
 
-  try {
-    const result = await withTimeout(
-      executeWithdrawOrder(payload, (tabId) => {
-        bitunixTabId = tabId;
-      }),
-      ORDER_TIMEOUT_MS,
-      'Order timed out after 5 minutes'
-    );
-
+  for (let attempt = 1; attempt <= WITHDRAW_ORDER_MAX_ATTEMPTS; attempt += 1) {
     if (isOrderCancelled(payload.orderId)) {
       setMessage('Withdraw cancelled.');
       return;
     }
 
-    socket?.emit('extension:order_result', {
-      orderId: payload.orderId,
-      status: 'completed',
-      output: result
-    });
+    if (attempt > 1) {
+      setMessage(`Retrying withdraw (${attempt}/${WITHDRAW_ORDER_MAX_ATTEMPTS})...`);
+      await delay(WITHDRAW_RETRY_DELAY_MS);
+      if (bitunixTabId !== undefined) {
+        await ensureTabOnWithdrawPage(bitunixTabId).catch(() => undefined);
+        await reloadWithdrawPage(bitunixTabId).catch(() => undefined);
+      }
+    }
 
-    setMessage('Withdraw complete.');
-    if (orderQueue.length === 0) {
-      void (async () => {
-        await delay(POST_SUCCESS_WALLET_DELAY_MS);
-        await moveToBitunixWallet(bitunixTabId, 'Opening Bitunix wallet...');
-      })();
-    }
-  } catch (error) {
-    if (isOrderCancelled(payload.orderId) || (error instanceof Error && error.message === ORDER_CANCELLED_MESSAGE)) {
-      setMessage('Withdraw cancelled.');
+    try {
+      const result = await withTimeout(
+        executeWithdrawOrder(payload, (tabId) => {
+          bitunixTabId = tabId;
+        }),
+        ORDER_TIMEOUT_MS,
+        `Order timed out after ${Math.round(ORDER_TIMEOUT_MS / 60000)} minutes`
+      );
+
+      if (isOrderCancelled(payload.orderId)) {
+        setMessage('Withdraw cancelled.');
+        return;
+      }
+
+      if (bitunixTabId !== undefined) {
+        setMessage('Settling withdraw page...');
+        await delay(POST_ORDER_SETTLE_MS);
+        await prepareWithdrawPage(bitunixTabId).catch(() => undefined);
+      }
+
+      socket?.emit('extension:order_result', {
+        orderId: payload.orderId,
+        status: 'completed',
+        output: result
+      });
+
+      setMessage('Withdraw complete.');
+      cancelPostOrderWalletNavigation();
+      if (orderQueue.length === 0) {
+        postOrderWalletTimer = window.setTimeout(() => {
+          postOrderWalletTimer = undefined;
+          if (orderQueue.length > 0 || runningOrderId !== null) return;
+          void moveToBitunixWallet(bitunixTabId, 'Opening Bitunix wallet...');
+        }, POST_SUCCESS_WALLET_DELAY_MS);
+      }
       return;
+    } catch (error) {
+      if (isOrderCancelled(payload.orderId) || (error instanceof Error && error.message === ORDER_CANCELLED_MESSAGE)) {
+        setMessage('Withdraw cancelled.');
+        return;
+      }
+
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (attempt >= WITHDRAW_ORDER_MAX_ATTEMPTS) {
+        break;
+      }
     }
-    const message = error instanceof Error ? error.message : 'Order failed';
-    setMessage(message);
-    socket?.emit('extension:order_result', {
-      orderId: payload.orderId,
-      status: 'failed',
-      error: message
-    });
-    void moveToBitunixWallet(bitunixTabId, 'Withdraw failed. Opening Bitunix wallet...');
   }
+
+  const message = lastError?.message || 'Order failed';
+  setMessage(message);
+  socket?.emit('extension:order_result', {
+    orderId: payload.orderId,
+    status: 'failed',
+    error: message
+  });
+  void moveToBitunixWallet(bitunixTabId, 'Withdraw failed. Opening Bitunix wallet...');
 }
 
 async function drainOrderQueue(): Promise<void> {
@@ -624,6 +931,7 @@ function enqueueOrder(payload: RunOrderPayload): void {
   if (isOrderCancelled(payload.orderId)) {
     return;
   }
+  cancelPostOrderWalletNavigation();
   orderQueue.push(payload);
   if (runningOrderId) {
     setMessage(`Order ${payload.orderId.slice(0, 8)} queued (${orderQueue.length} waiting)…`);

@@ -5,14 +5,18 @@ import type {
   ExtensionRecord,
   GmailAccount,
   GmailStatus,
+  LaunchWorkflow,
+  LaunchWorkflowInput,
   TokenLaunchInput,
   TokenLaunchJob,
   TokenLaunchStatusResponse,
+  TokenLaunchTradesBackfillResult,
+  TokenLaunchTradesResponse,
   UnremovedLpPosition,
   LpRemovalResult
 } from './types';
 
-export type { TokenLaunchInput };
+export type { TokenLaunchInput, LaunchWorkflowInput };
 
 export interface WithdrawOrderInput {
   currency: string;
@@ -78,6 +82,18 @@ class BackendClient {
     return this.readJson('/api/tokenlaunch');
   }
 
+  getTokenLaunchTrades(jobId: string, refresh = false): Promise<TokenLaunchTradesResponse> {
+    const params = refresh ? '?refresh=true' : '';
+    return this.readJson(`/api/tokenlaunch/${encodeURIComponent(jobId)}/trades${params}`);
+  }
+
+  backfillTokenLaunchTrades(onlyMissing = false): Promise<TokenLaunchTradesBackfillResult> {
+    return this.readJson('/api/tokenlaunch/trades/backfill', {
+      method: 'POST',
+      body: JSON.stringify({ onlyMissing })
+    });
+  }
+
   startTokenLaunch(input: TokenLaunchInput): Promise<TokenLaunchJob> {
     return this.readJson('/api/tokenlaunch', {
       method: 'POST',
@@ -111,6 +127,35 @@ class BackendClient {
     return this.readJson('/api/tokenlaunch/lp/remove', {
       method: 'POST',
       body: JSON.stringify(input)
+    });
+  }
+
+  getLaunchWorkflows(): Promise<LaunchWorkflow[]> {
+    return this.readJson('/api/workflows');
+  }
+
+  getLaunchWorkflow(workflowId: string): Promise<LaunchWorkflow> {
+    return this.readJson(`/api/workflows/${encodeURIComponent(workflowId)}`);
+  }
+
+  startLaunchWorkflow(input: LaunchWorkflowInput): Promise<LaunchWorkflow> {
+    return this.readJson('/api/workflows', {
+      method: 'POST',
+      body: JSON.stringify(input)
+    });
+  }
+
+  cancelLaunchWorkflow(workflowId: string): Promise<LaunchWorkflow> {
+    return this.readJson(`/api/workflows/${encodeURIComponent(workflowId)}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify({})
+    });
+  }
+
+  depositLaunchWorkflow(workflowId: string): Promise<LaunchWorkflow> {
+    return this.readJson(`/api/workflows/${encodeURIComponent(workflowId)}/deposit`, {
+      method: 'POST',
+      body: JSON.stringify({})
     });
   }
 
@@ -167,6 +212,10 @@ export const createOrder = (extensionId: string, input: WithdrawOrderInput) => c
 export const cancelOrder = (orderId: string) => client.cancelOrder(orderId);
 export const getTokenLaunchStatus = () => client.getTokenLaunchStatus();
 export const getTokenLaunchJobs = () => client.getTokenLaunchJobs();
+export const getTokenLaunchTrades = (jobId: string, refresh = false) =>
+  client.getTokenLaunchTrades(jobId, refresh);
+export const backfillTokenLaunchTrades = (onlyMissing = false) =>
+  client.backfillTokenLaunchTrades(onlyMissing);
 export const startTokenLaunch = (input: TokenLaunchInput) => client.startTokenLaunch(input);
 export const manualTokenLaunchBuy = (jobId: string, wallet: 2 | 3, ethAmount?: string) =>
   client.manualTokenLaunchBuy(jobId, wallet, ethAmount);
@@ -174,6 +223,11 @@ export const finishTokenLaunch = (jobId: string) => client.finishTokenLaunch(job
 export const getUnremovedLp = () => client.getUnremovedLp();
 export const removeUnremovedLp = (input: { poolAddress: string } | { all: true }) =>
   client.removeUnremovedLp(input);
+export const getLaunchWorkflows = () => client.getLaunchWorkflows();
+export const getLaunchWorkflow = (workflowId: string) => client.getLaunchWorkflow(workflowId);
+export const startLaunchWorkflow = (input: LaunchWorkflowInput) => client.startLaunchWorkflow(input);
+export const cancelLaunchWorkflow = (workflowId: string) => client.cancelLaunchWorkflow(workflowId);
+export const depositLaunchWorkflow = (workflowId: string) => client.depositLaunchWorkflow(workflowId);
 export const getGmailStatus = () => client.getGmailStatus();
 export const getGmailAccounts = () => client.getGmailAccounts();
 export const getGmailMessages = (accountId?: string) => client.getGmailMessages(accountId);

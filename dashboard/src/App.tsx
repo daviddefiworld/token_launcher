@@ -3,10 +3,12 @@ import type { FormEvent } from 'react';
 import { Link, NavLink, Navigate, Route, Routes, useParams } from 'react-router-dom';
 import { GmailsPage } from './pages/GmailsPage';
 import { OrdersPage } from './pages/OrdersPage';
+import { LaunchAnalyzerPage } from './pages/LaunchAnalyzerPage';
 import { TokenLaunchPage } from './pages/TokenLaunchPage';
+import { WorkflowPage } from './pages/WorkflowPage';
 import { io, Socket } from 'socket.io-client';
-import { createOrder, cancelOrder, getActivity, getBackendUrl, getExtensions, getOrders, getTokenLaunchJobs, type WithdrawOrderInput } from './api';
-import type { ActivityItem, AutomationOrder, ExtensionRecord, TokenLaunchJob, VerificationCodeRequest } from './types';
+import { createOrder, cancelOrder, getActivity, getBackendUrl, getExtensions, getLaunchWorkflows, getOrders, getTokenLaunchJobs, type WithdrawOrderInput } from './api';
+import type { ActivityItem, AutomationOrder, ExtensionRecord, LaunchWorkflow, TokenLaunchJob, VerificationCodeRequest } from './types';
 import {
   ActivityMapper,
   ORDER_CANCELLED_MESSAGE,
@@ -36,6 +38,7 @@ function Header({ connected }: { connected: boolean }) {
         Token Automation
       </Link>
       <nav className="topbar-nav">
+        <NavLink to="/workflow">Workflow</NavLink>
         <NavLink to="/" end>
           Extensions
         </NavLink>
@@ -371,6 +374,7 @@ function App() {
   const [extensions, setExtensions] = useState<ExtensionRecord[]>([]);
   const [orders, setOrders] = useState<AutomationOrder[]>([]);
   const [tokenLaunches, setTokenLaunches] = useState<TokenLaunchJob[]>([]);
+  const [workflows, setWorkflows] = useState<LaunchWorkflow[]>([]);
   const [activity, setActivity] = useState<ActivityItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [activityLoading, setActivityLoading] = useState(true);
@@ -397,6 +401,10 @@ function App() {
     setTokenLaunches(await getTokenLaunchJobs());
   }, []);
 
+  const reloadWorkflows = useCallback(async () => {
+    setWorkflows(await getLaunchWorkflows());
+  }, []);
+
   const reloadActivity = useCallback(async () => {
     setActivityLoading(true);
     try {
@@ -416,11 +424,13 @@ function App() {
       extensions: ExtensionRecord[];
       orders: AutomationOrder[];
       tokenLaunches?: TokenLaunchJob[];
+      workflows?: LaunchWorkflow[];
       activity?: ActivityItem[];
     }) => {
       setExtensions(data.extensions || []);
       setOrders(data.orders || []);
       setTokenLaunches(data.tokenLaunches || []);
+      setWorkflows(data.workflows || []);
       setActivity(data.activity || []);
       setLoading(false);
       setActivityLoading(false);
@@ -475,15 +485,39 @@ function App() {
       );
     });
 
+    socket.on('workflow:created', (data: { workflow: LaunchWorkflow }) => {
+      setWorkflows((current) => upsertById(current, data.workflow, (w) => w.workflowId, data.workflow.workflowId));
+      setActivity((current) =>
+        upsertById(
+          current,
+          ActivityMapper.fromLaunchWorkflow(data.workflow),
+          (i) => `${i.kind}:${i.id}`,
+          `launch_workflow:${data.workflow.workflowId}`
+        )
+      );
+    });
+    socket.on('workflow:updated', (data: { workflow: LaunchWorkflow }) => {
+      setWorkflows((current) => upsertById(current, data.workflow, (w) => w.workflowId, data.workflow.workflowId));
+      setActivity((current) =>
+        upsertById(
+          current,
+          ActivityMapper.fromLaunchWorkflow(data.workflow),
+          (i) => `${i.kind}:${i.id}`,
+          `launch_workflow:${data.workflow.workflowId}`
+        )
+      );
+    });
+
     void reloadExtensions();
     void reloadOrders();
     void reloadTokenLaunches();
+    void reloadWorkflows();
     void reloadActivity();
 
     return () => {
       socket.disconnect();
     };
-  }, [socket, reloadExtensions, reloadOrders, reloadTokenLaunches, reloadActivity]);
+  }, [socket, reloadExtensions, reloadOrders, reloadTokenLaunches, reloadWorkflows, reloadActivity]);
 
   return (
     <>
@@ -502,6 +536,13 @@ function App() {
           path="/tokenlaunch"
           element={<TokenLaunchPage jobs={tokenLaunches} reloadJobs={reloadTokenLaunches} />}
         />
+        <Route
+          path="/workflow"
+          element={
+            <WorkflowPage extensions={extensions} workflows={workflows} reloadWorkflows={reloadWorkflows} />
+          }
+        />
+        <Route path="/tokenlaunch/:jobId" element={<LaunchAnalyzerPage />} />
         <Route
           path="/orders"
           element={<OrdersPage activity={activity} reload={() => void reloadActivity()} loading={activityLoading} />}

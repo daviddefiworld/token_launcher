@@ -12,7 +12,21 @@ import {
   type WalletClient
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import type { TokenLaunchInput, TokenLaunchJob, LpRemovalResult, UnremovedLpPosition } from '../../types';
+import type {
+  TokenLaunchInput,
+  TokenLaunchJob,
+  LpRemovalResult,
+  UnremovedLpPosition,
+  TokenLaunchTradesBackfillResult,
+  TokenLaunchTradesResponse
+} from '../../types';
+import {
+  computeTradeStats,
+  countExternalBuyersFromTrades,
+  fetchPoolTrades,
+  mergeTrades,
+  resolveFromBlock
+} from './swaps';
 import { TokenLaunchRepository, nowIso } from '../../persist';
 import {
   AERODROME,
@@ -37,6 +51,8 @@ export type TokenLaunchBroadcast = (job: TokenLaunchJob, event: 'created' | 'upd
 
 const MAX_REPEAT_COUNT = 50;
 const LP_SCAN_DELAY_MS = 800;
+const TRADES_BACKFILL_JOB_DELAY_MS = 1_200;
+const TRADES_BACKFILL_START_DELAY_MS = 8_000;
 
 function resolveRemoveLpTimeMinutes(input: TokenLaunchInput): number {
   return input.removeLpTimeMinutes ?? DEFAULT_REMOVE_LP_TIME_MINUTES;
@@ -142,18 +158,73 @@ export class TokenLaunchService {
   private repeatRemaining = 0;
   private readonly manualBuyInFlight = new Set<string>();
   private readonly cancelled = new Set<string>();
+  private tradesBackfillRunning = false;
+  private sessionWalletKeys: {
+    wallet1: `0x${string}`;
+    wallet2: `0x${string}`;
+    wallet3?: `0x${string}`;
+  } | null = null;
 
   constructor(
     private readonly repository: TokenLaunchRepository,
     private readonly broadcast?: TokenLaunchBroadcast
-  ) {}
+  ) {
+    setTimeout(() => {
+      void this.backfillAllTrades({ onlyMissing: true }).catch((error) => {
+        console.error('Token launch trades backfill failed:', formatViemError(error));
+      });
+    }, TRADES_BACKFILL_START_DELAY_MS);
+  }
 
   isConfigured(): boolean {
-    return Boolean(
-      process.env.WALLET_1_PRIVATE_KEY?.trim() &&
-        process.env.WALLET_2_PRIVATE_KEY?.trim() &&
-        (process.env.BASE_RPC_URL?.trim() || true)
-    );
+    const keys = this.resolveWalletKeys();
+    return Boolean(keys.wallet1 && keys.wallet2 && (process.env.BASE_RPC_URL?.trim() || true));
+  }
+
+  hasActiveLaunch(): boolean {
+    return Boolean(this.repository.findActive()) || this.repeatRemaining > 0 || this.running.size > 0;
+  }
+
+  useSessionWallets(keys: { wallet1: string; wallet2: string; wallet3?: string }): void {
+    this.sessionWalletKeys = {
+      wallet1: normalizePrivateKey(keys.wallet1),
+      wallet2: normalizePrivateKey(keys.wallet2),
+      wallet3: keys.wallet3 ? normalizePrivateKey(keys.wallet3) : undefined
+    };
+    this.resetClients();
+  }
+
+  clearSessionWallets(): void {
+    this.sessionWalletKeys = null;
+    this.resetClients();
+  }
+
+  private resolveWalletKeys(): { wallet1?: string; wallet2?: string; wallet3?: string } {
+    if (this.sessionWalletKeys) {
+      return {
+        wallet1: this.sessionWalletKeys.wallet1,
+        wallet2: this.sessionWalletKeys.wallet2,
+        wallet3: this.sessionWalletKeys.wallet3
+      };
+    }
+    return {
+      wallet1: process.env.WALLET_1_PRIVATE_KEY?.trim(),
+      wallet2: process.env.WALLET_2_PRIVATE_KEY?.trim(),
+      wallet3: process.env.WALLET_3_PRIVATE_KEY?.trim()
+    };
+  }
+
+  private resetClients(): void {
+    this.publicClient = null;
+    this.wallet1 = null;
+    this.wallet2 = null;
+    this.wallet3 = null;
+    this.wallet1Account = null;
+    this.wallet2Account = null;
+    this.wallet3Account = null;
+    this.wallet1Address = null;
+    this.wallet2Address = null;
+    this.wallet3Address = null;
   }
 
   getStatus(): {
@@ -165,17 +236,15 @@ export class TokenLaunchService {
     rpcUrl: string;
   } {
     const rpcUrl = process.env.BASE_RPC_URL?.trim() || 'https://mainnet.base.org';
-    const wallet1Key = process.env.WALLET_1_PRIVATE_KEY?.trim();
-    const wallet2Key = process.env.WALLET_2_PRIVATE_KEY?.trim();
-    const wallet3Key = process.env.WALLET_3_PRIVATE_KEY?.trim();
-    if (!wallet1Key || !wallet2Key) {
-      return { configured: false, wallet3Configured: Boolean(wallet3Key), rpcUrl };
+    const keys = this.resolveWalletKeys();
+    if (!keys.wallet1 || !keys.wallet2) {
+      return { configured: false, wallet3Configured: Boolean(keys.wallet3), rpcUrl };
     }
 
     try {
       this.ensureClients();
     } catch {
-      return { configured: false, wallet3Configured: Boolean(wallet3Key), rpcUrl };
+      return { configured: false, wallet3Configured: Boolean(keys.wallet3), rpcUrl };
     }
 
     return {
@@ -183,7 +252,7 @@ export class TokenLaunchService {
       wallet1Address: this.wallet1Address ?? undefined,
       wallet2Address: this.wallet2Address ?? undefined,
       wallet3Address: this.wallet3Address ?? undefined,
-      wallet3Configured: Boolean(wallet3Key),
+      wallet3Configured: Boolean(keys.wallet3),
       rpcUrl
     };
   }
@@ -193,8 +262,9 @@ export class TokenLaunchService {
   }
 
   private validateLaunchInput(input: TokenLaunchInput): void {
-    if (resolveUseWallet3(input) && !process.env.WALLET_3_PRIVATE_KEY?.trim()) {
-      throw new Error('useWallet3 requires WALLET_3_PRIVATE_KEY in backend/.env');
+    const keys = this.resolveWalletKeys();
+    if (resolveUseWallet3(input) && !keys.wallet3) {
+      throw new Error('useWallet3 requires a third wallet (WALLET_3_PRIVATE_KEY or workflow wallet 3)');
     }
   }
 
@@ -204,6 +274,115 @@ export class TokenLaunchService {
 
   get(jobId: string): TokenLaunchJob | undefined {
     return this.repository.get(jobId);
+  }
+
+  private getOurWalletSet(): Set<string> {
+    const wallets = new Set<string>();
+    if (this.wallet1Address) wallets.add(this.wallet1Address.toLowerCase());
+    if (this.wallet2Address) wallets.add(this.wallet2Address.toLowerCase());
+    if (this.wallet3Address) wallets.add(this.wallet3Address.toLowerCase());
+    return wallets;
+  }
+
+  async getTrades(jobId: string, refresh = false): Promise<TokenLaunchTradesResponse> {
+    const job = this.repository.get(jobId);
+    if (!job) throw new Error('Token launch job not found');
+    if (!job.tokenAddress || !job.poolAddress) {
+      throw new Error('Trades are not available until token and pool are created');
+    }
+    if (!refresh && job.trades && job.trades.length > 0) {
+      return this.buildTradesResponse(job);
+    }
+    return this.syncTrades(jobId);
+  }
+
+  async backfillAllTrades(options?: { onlyMissing?: boolean }): Promise<TokenLaunchTradesBackfillResult> {
+    if (!this.isConfigured()) {
+      return { processed: 0, skipped: 0, failed: [] };
+    }
+    if (this.tradesBackfillRunning) {
+      throw new Error('Trades backfill is already running');
+    }
+    this.ensureClients();
+    this.tradesBackfillRunning = true;
+
+    const result: TokenLaunchTradesBackfillResult = { processed: 0, skipped: 0, failed: [] };
+
+    try {
+      const jobs = this.repository
+        .list()
+        .filter((job) => job.tokenAddress && job.poolAddress);
+
+      for (const job of jobs) {
+        if (options?.onlyMissing && job.trades && job.trades.length > 0) {
+          result.skipped += 1;
+          continue;
+        }
+
+        try {
+          await this.syncTrades(job.jobId);
+          result.processed += 1;
+        } catch (error) {
+          result.failed.push({
+            jobId: job.jobId,
+            error: formatViemError(error)
+          });
+        }
+        await sleep(TRADES_BACKFILL_JOB_DELAY_MS);
+      }
+    } finally {
+      this.tradesBackfillRunning = false;
+    }
+
+    return result;
+  }
+
+  private buildTradesResponse(job: TokenLaunchJob): TokenLaunchTradesResponse {
+    const trades = job.trades ?? [];
+    return {
+      jobId: job.jobId,
+      tokenAddress: job.tokenAddress!,
+      poolAddress: job.poolAddress!,
+      trades,
+      stats: computeTradeStats(trades),
+      tradesSyncedAt: job.tradesSyncedAt
+    };
+  }
+
+  async syncTrades(jobId: string): Promise<TokenLaunchTradesResponse> {
+    this.ensureClients();
+    const job = this.repository.get(jobId);
+    if (!job) throw new Error('Token launch job not found');
+    if (!job.tokenAddress || !job.poolAddress) {
+      throw new Error('Trades are not available until token and pool are created');
+    }
+
+    const publicClient = this.publicClient!;
+    const tokenAddress = getAddress(job.tokenAddress);
+    const poolAddress = getAddress(job.poolAddress);
+    const sinceMs = new Date(job.createdAt).getTime() - 60_000;
+    const fromBlock = await withRpcRetry('resolve trade fromBlock', () =>
+      resolveFromBlock(
+        publicClient,
+        job.deployTxHash as `0x${string}` | undefined,
+        job.deployBlockNumber,
+        sinceMs
+      )
+    );
+
+    const fetched = await withRpcRetry(`pool trades for ${jobId}`, () =>
+      fetchPoolTrades(publicClient, poolAddress, tokenAddress, fromBlock, this.getOurWalletSet())
+    );
+
+    const trades = mergeTrades(job.trades ?? [], fetched);
+    const buyerCount = countExternalBuyersFromTrades(trades);
+    const updated = this.patch(jobId, {
+      trades,
+      buyerCount,
+      tradesSyncedAt: nowIso()
+    });
+
+    return this.buildTradesResponse(updated);
   }
 
   finish(jobId: string): TokenLaunchJob {
@@ -322,16 +501,17 @@ export class TokenLaunchService {
   }
 
   private ensureClients(): void {
-    const wallet3Key = process.env.WALLET_3_PRIVATE_KEY?.trim();
+    const keys = this.resolveWalletKeys();
+    const wallet3Key = keys.wallet3;
     const wallet3Ready = Boolean(wallet3Key && this.wallet3 && this.wallet3Account);
     if (this.publicClient && this.wallet1 && this.wallet2 && this.wallet1Account && this.wallet2Account) {
       if (!wallet3Key || wallet3Ready) return;
     }
 
-    const wallet1Key = process.env.WALLET_1_PRIVATE_KEY?.trim();
-    const wallet2Key = process.env.WALLET_2_PRIVATE_KEY?.trim();
+    const wallet1Key = keys.wallet1;
+    const wallet2Key = keys.wallet2;
     if (!wallet1Key || !wallet2Key) {
-      throw new Error('WALLET_1_PRIVATE_KEY and WALLET_2_PRIVATE_KEY must be set in backend/.env');
+      throw new Error('Wallet 1 and wallet 2 private keys must be configured');
     }
 
     const rpcUrl = process.env.BASE_RPC_URL?.trim() || 'https://mainnet.base.org';
@@ -518,6 +698,7 @@ export class TokenLaunchService {
       this.patch(jobId, {
         tokenAddress,
         deployTxHash: deployHash,
+        deployBlockNumber: Number(deployReceipt.blockNumber),
         status: 'adding_liquidity',
         phase: 'Creating Aerodrome LP'
       });
@@ -596,10 +777,6 @@ export class TokenLaunchService {
       const minBuyersBeforeRemoveLp = resolveMinBuyersBeforeRemoveLp(job.input);
       const useWallet3 = this.jobUsesWallet3(job.input);
       const buyAfterMs = resolveBuyAfterMs(job.input);
-      const ourWallets = new Set([wallet1Address.toLowerCase(), wallet2Address.toLowerCase()]);
-      if (useWallet3 && this.wallet3Address) {
-        ourWallets.add(this.wallet3Address.toLowerCase());
-      }
       const wallet2BuyEth = resolveWallet2BuyEthAmount(job.input);
 
       const buyerThresholdMet = (count: number) => count >= minBuyersBeforeRemoveLp;
@@ -632,14 +809,12 @@ export class TokenLaunchService {
       while (Date.now() - monitorStartedAt < monitorDurationMs) {
         if (this.cancelled.has(jobId)) return;
         const elapsed = Date.now() - monitorStartedAt;
-        const buyers = await this.countExternalBuyers(
-          publicClient,
-          poolAddress,
-          tokenAddress,
-          monitorStartedAt,
-          ourWallets
-        );
-        buyerCount = buyers;
+        try {
+          const synced = await this.syncTrades(jobId);
+          buyerCount = synced.stats.externalBuyers;
+        } catch (error) {
+          console.error(`Trade sync failed for ${jobId}:`, formatViemError(error));
+        }
         this.patch(jobId, { buyerCount, phase: buyerMonitorPhase(buyerCount) });
 
         if (buyerThresholdMet(buyerCount)) {
@@ -804,68 +979,6 @@ export class TokenLaunchService {
     throw new Error('Aerodrome pool was not created');
   }
 
-  private async countExternalBuyers(
-    client: { readContract: (...args: unknown[]) => Promise<unknown>; getLogs: (...args: unknown[]) => Promise<unknown[]> },
-    poolAddress: Address,
-    tokenAddress: Address,
-    sinceMs: number,
-    ourWallets: Set<string>
-  ): Promise<number> {
-    const token0 = (await client.readContract({
-      address: poolAddress,
-      abi: aerodromePoolAbi,
-      functionName: 'token0'
-    })) as Address;
-    const tokenIs0 = getAddress(token0) === getAddress(tokenAddress);
-    const sinceBlock = await this.blockNearTimestamp(this.publicClient, sinceMs);
-    const logs = (await client.getLogs({
-      address: poolAddress,
-      event: aerodromePoolAbi[0],
-      fromBlock: sinceBlock
-    })) as Array<{ data: `0x${string}`; topics: [] | [`0x${string}`, ...`0x${string}`[]] }>;
-
-    const buyers = new Set<string>();
-    for (const log of logs) {
-      const decoded = decodeEventLog({
-        abi: aerodromePoolAbi,
-        data: log.data,
-        topics: log.topics
-      });
-      if (decoded.eventName !== 'Swap') continue;
-
-      const { sender, to, amount0In, amount1In, amount0Out, amount1Out } = decoded.args as {
-        sender: Address;
-        to: Address;
-        amount0In: bigint;
-        amount1In: bigint;
-        amount0Out: bigint;
-        amount1Out: bigint;
-      };
-
-      const boughtToken = tokenIs0 ? amount0Out > 0n && amount1In > 0n : amount1Out > 0n && amount0In > 0n;
-      if (!boughtToken) continue;
-
-      for (const participant of [sender, to]) {
-        if (!ourWallets.has(participant.toLowerCase())) {
-          buyers.add(participant.toLowerCase());
-        }
-      }
-    }
-
-    return buyers.size;
-  }
-
-  private async blockNearTimestamp(client: { getBlockNumber: () => Promise<bigint>; getBlock: (args: { blockNumber: bigint }) => Promise<{ timestamp: bigint }> } | null, timestampMs: number): Promise<bigint> {
-    if (!client) return 0n;
-    const latest = await client.getBlockNumber();
-    const latestBlock = await client.getBlock({ blockNumber: latest });
-    const latestTs = Number(latestBlock.timestamp) * 1000;
-    if (timestampMs >= latestTs) return latest;
-
-    const secondsAgo = Math.max(0, Math.floor((latestTs - timestampMs) / 1000));
-    const estimatedBlocks = BigInt(Math.min(Number(latest), Math.max(1, Math.ceil(secondsAgo / 2))));
-    return latest > estimatedBlocks ? latest - estimatedBlocks : 0n;
-  }
 
   async listUnremovedLp(): Promise<UnremovedLpPosition[]> {
     this.ensureClients();

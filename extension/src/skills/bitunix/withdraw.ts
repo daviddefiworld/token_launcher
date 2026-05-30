@@ -20,6 +20,8 @@ import {
 export const BITUNIX_HOST = 'www.bitunix.com';
 export const WITHDRAW_PATH = '/assets/withdraw';
 export const WAIT = { short: 15000, medium: 45000, long: 90000, poll: 250 } as const;
+export const POST_VERIFICATION_WAIT_MS = 10_000;
+const COIN_SELECT_TIMEOUT_MS = 20_000;
 
 function tokenMatches(selected: string, expected: string): boolean {
   const normalizedSelected = normalize(selected);
@@ -89,9 +91,8 @@ async function dismissOpenDropdowns(): Promise<void> {
 }
 
 async function waitForCoinSelected(currency: string): Promise<void> {
-  await waitFor(() => (isCoinSelected(currency) ? true : null), WAIT.long);
+  await waitFor(() => (isCoinSelected(currency) ? true : null), COIN_SELECT_TIMEOUT_MS);
   assertCoinSelected(currency);
-  await stepDelay();
 }
 
 function findCoinHotButton(currency: string): HTMLElement | null {
@@ -126,56 +127,61 @@ function findCoinOptionInDropdown(currency: string): HTMLElement | null {
   );
 }
 
-async function openCoinDropdown(): Promise<HTMLInputElement> {
-  const input = await waitFor(() => findCoinSearchInput(), WAIT.medium);
-  clickElement(input);
-  await stepDelay();
-  return input;
+function findCoinSelectTrigger(): HTMLElement | null {
+  const wrapper = findSymbolSelectWrapper();
+  if (!wrapper) return null;
+  return (
+    wrapper.querySelector<HTMLElement>('.arco-select-view') ||
+    wrapper.querySelector<HTMLElement>('.select_input') ||
+    wrapper
+  );
 }
 
-async function selectCoinViaHotButton(currency: string): Promise<boolean> {
-  const hotButton = findCoinHotButton(currency);
-  if (!hotButton) return false;
-
-  clickElement(hotButton);
-  try {
-    await waitForCoinSelected(currency);
-    return true;
-  } catch {
-    return false;
+async function openCoinDropdown(): Promise<HTMLInputElement> {
+  const trigger = findCoinSelectTrigger();
+  if (trigger) {
+    clickElement(trigger);
+    await stepDelay(300);
   }
+
+  const input = await waitFor(() => findCoinSearchInput(), WAIT.short);
+  clickElement(input);
+  await stepDelay(200);
+  return input;
 }
 
 async function selectCoinViaDropdown(currency: string): Promise<void> {
   const input = await openCoinDropdown();
   setFieldValue(input, currency, { blur: false });
-  await stepDelay();
+  await stepDelay(200);
 
   if (!includesAny(input.value, [currency])) {
     typeFieldValue(input, currency);
-    await stepDelay();
+    await stepDelay(200);
   }
 
-  input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-  await stepDelay();
-
-  const option = await waitFor(() => findCoinOptionInDropdown(currency), WAIT.long);
+  const option = await waitFor(() => findCoinOptionInDropdown(currency), COIN_SELECT_TIMEOUT_MS);
   clickElement(option);
   await waitForCoinSelected(currency);
 }
 
 async function selectCoin(currency: string): Promise<void> {
+  if (isCoinSelected(currency)) return;
+
   await dismissOpenDropdowns();
 
-  const hotWorked = await selectCoinViaHotButton(currency);
-  if (hotWorked) {
-    assertCoinSelected(currency);
-    return;
+  const hotButton = findCoinHotButton(currency);
+  if (hotButton) {
+    clickElement(hotButton);
+    try {
+      await waitForCoinSelected(currency);
+      return;
+    } catch {
+      await dismissOpenDropdowns();
+    }
   }
 
-  await dismissOpenDropdowns();
   await selectCoinViaDropdown(currency);
-  assertCoinSelected(currency);
 }
 
 function findNetworkSection(): ParentNode {
@@ -258,7 +264,7 @@ async function selectChain(chain: string, currency: string): Promise<void> {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
       await delay(1200 * attempt);
 
-      if (attempt % 2 === 0) {
+      if (!isCoinSelected(currency)) {
         await selectCoin(currency);
       }
     }
@@ -515,6 +521,8 @@ export async function submitVerification(message: TokenAutomationMessage): Promi
 
   await retryStep('Fill verification codes', () => fillVerificationCodes(emailCode, authenticatorCode), writeStatus);
   await retryStep('Submit verification', clickVerificationSubmit, writeStatus);
+  writeStatus('Verification submitted — waiting 10s for Bitunix to process...');
+  await delay(POST_VERIFICATION_WAIT_MS);
   writeStatus('Bitunix withdraw verification submitted');
   return successResponse('Bitunix withdraw verification submitted');
 }
@@ -529,9 +537,34 @@ async function waitForWithdrawFormReady(): Promise<void> {
   );
 }
 
+export async function prepareForNextWithdraw(): Promise<void> {
+  if (window.location.hostname !== BITUNIX_HOST) {
+    throw new Error('Not on Bitunix');
+  }
+  if (!window.location.pathname.startsWith(WITHDRAW_PATH)) {
+    throw new Error('Open the Bitunix withdraw page before running this skill');
+  }
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    const closeButton = findButtonByText(
+      ['Close', 'OK', 'Confirm', 'Got it', 'Done', 'I understand'],
+      findDialogRoot()
+    );
+    if (closeButton) {
+      clickElement(closeButton);
+    }
+    await stepDelay(250);
+  }
+
+  await waitForWithdrawFormReady();
+  await stepDelay(400);
+}
+
 export async function runWithdraw(message: TokenAutomationMessage): Promise<AutomationResponse> {
   const request = assertWithdrawRequest(message);
   assertBitunixWithdrawPage();
+  document.getElementById('token-automation-order-done')?.remove();
   writeStatus(
     `Withdraw ${request.amount} ${request.currency} on ${request.chain} → ${request.address.slice(0, 10)}…`
   );
