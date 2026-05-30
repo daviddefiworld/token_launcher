@@ -9,7 +9,7 @@ export interface ExtensionRecord {
   version?: string;
 }
 
-export type OrderStatus = 'pending' | 'executing' | 'completed' | 'failed';
+export type OrderStatus = 'pending' | 'executing' | 'completed' | 'failed' | 'cancelled';
 
 export interface WithdrawRequest {
   text: string;
@@ -53,7 +53,82 @@ export interface GmailStatus {
   accounts: GmailAccount[];
 }
 
-export type ActivityKind = 'withdraw' | 'email_verification';
+export type ActivityKind = 'withdraw' | 'email_verification' | 'token_launch';
+
+export type TokenLaunchStatus =
+  | 'pending'
+  | 'deploying'
+  | 'adding_liquidity'
+  | 'monitoring'
+  | 'buying'
+  | 'removing_liquidity'
+  | 'completed'
+  | 'failed';
+
+export interface TokenLaunchInput {
+  tokenName: string;
+  tokenSymbol: string;
+  lpEthAmount: string;
+  wallet2BuyEthAmount: string;
+  buyEthAmount: string;
+  useWallet3: boolean;
+  buyAfterSeconds: number;
+  repeatCount: number;
+  removeLp: boolean;
+  removeLpTimeMinutes: number;
+  minBuyersBeforeRemoveLp: number;
+}
+
+export interface TokenLaunchJob {
+  jobId: string;
+  status: TokenLaunchStatus;
+  input: TokenLaunchInput;
+  repeatIndex?: number;
+  repeatTotal?: number;
+  tokenAddress?: string;
+  poolAddress?: string;
+  deployTxHash?: string;
+  addLiquidityTxHash?: string;
+  buyTxHash?: string;
+  wallet3BuyTxHash?: string;
+  wallet1BuyTxHash?: string;
+  removeLiquidityTxHash?: string;
+  buyerCount: number;
+  lpRemoved: boolean;
+  wallet2BuyExecuted: boolean;
+  wallet3BuyExecuted?: boolean;
+  phase?: string;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface UnremovedLpPosition {
+  poolAddress: string;
+  tokenAddress: string;
+  lpBalance: string;
+  jobIds: string[];
+  tokenName?: string;
+  tokenSymbol?: string;
+}
+
+export interface LpRemovalResult {
+  poolAddress: string;
+  tokenAddress: string;
+  txHash?: string;
+  success: boolean;
+  error?: string;
+}
+
+export interface TokenLaunchStatusResponse {
+  configured: boolean;
+  wallet1Address?: string;
+  wallet2Address?: string;
+  wallet3Address?: string;
+  wallet3Configured?: boolean;
+  rpcUrl: string;
+}
 
 export interface ActivityItem {
   id: string;
@@ -76,6 +151,16 @@ export interface ActivityItem {
   message?: string;
   pageUrl?: string;
   executeTimeMs?: number;
+  tokenLaunch?: {
+    tokenName: string;
+    tokenSymbol: string;
+    lpEthAmount: string;
+    buyEthAmount: string;
+    tokenAddress?: string;
+    poolAddress?: string;
+    buyerCount?: number;
+    phase?: string;
+  };
   createdAt: string;
   updatedAt: string;
 }

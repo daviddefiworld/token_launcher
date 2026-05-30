@@ -3,14 +3,17 @@ import type { FormEvent } from 'react';
 import { Link, NavLink, Navigate, Route, Routes, useParams } from 'react-router-dom';
 import { GmailsPage } from './pages/GmailsPage';
 import { OrdersPage } from './pages/OrdersPage';
+import { TokenLaunchPage } from './pages/TokenLaunchPage';
 import { io, Socket } from 'socket.io-client';
-import { createOrder, getActivity, getBackendUrl, getExtensions, getOrders, type WithdrawOrderInput } from './api';
-import type { ActivityItem, AutomationOrder, ExtensionRecord, VerificationCodeRequest } from './types';
+import { createOrder, cancelOrder, getActivity, getBackendUrl, getExtensions, getOrders, getTokenLaunchJobs, type WithdrawOrderInput } from './api';
+import type { ActivityItem, AutomationOrder, ExtensionRecord, TokenLaunchJob, VerificationCodeRequest } from './types';
 import {
   ActivityMapper,
+  ORDER_CANCELLED_MESSAGE,
   formatDuration,
   formatRelativeTime,
   formatUtcTime,
+  isActiveOrderStatus,
   orderCompletedAt,
   orderStatusClass,
   shortId,
@@ -37,6 +40,7 @@ function Header({ connected }: { connected: boolean }) {
           Extensions
         </NavLink>
         <NavLink to="/gmails">Gmails</NavLink>
+        <NavLink to="/tokenlaunch">Token Launch</NavLink>
         <NavLink to="/orders">Orders</NavLink>
       </nav>
       <span className={connected ? 'pill success' : 'pill muted'}>
@@ -94,8 +98,25 @@ function ExtensionsPage({
   );
 }
 
-function OrderList({ orders }: { orders: AutomationOrder[] }) {
+function OrderList({
+  orders,
+  onCancel
+}: {
+  orders: AutomationOrder[];
+  onCancel?: (orderId: string) => Promise<void>;
+}) {
   const recentOrders = orders.slice(0, 3);
+  const [cancelBusy, setCancelBusy] = useState<string | null>(null);
+
+  const handleCancel = async (orderId: string) => {
+    if (!onCancel) return;
+    setCancelBusy(orderId);
+    try {
+      await onCancel(orderId);
+    } finally {
+      setCancelBusy(null);
+    }
+  };
 
   if (orders.length === 0) {
     return <div className="empty small">No orders sent to this extension yet.</div>;
@@ -118,6 +139,18 @@ function OrderList({ orders }: { orders: AutomationOrder[] }) {
             )}
             {order.output?.message && <p className="result">{order.output.message}</p>}
             {order.error && <p className="error">{order.error}</p>}
+            {isActiveOrderStatus(order.status) && onCancel && (
+              <div className="button-row" style={{ marginTop: 12 }}>
+                <button
+                  type="button"
+                  className="button secondary danger-outline"
+                  disabled={cancelBusy === order.orderId}
+                  onClick={() => void handleCancel(order.orderId)}
+                >
+                  {cancelBusy === order.orderId ? 'Cancelling...' : 'Cancel'}
+                </button>
+              </div>
+            )}
           </article>
         ))}
       </div>
@@ -143,8 +176,10 @@ function ExtensionDetailPage({
   const extensionId = rawExtensionId ? decodeURIComponent(rawExtensionId) : '';
   const extension = extensions.find((item) => item.extensionId === extensionId);
   const extensionOrders = orders.filter((order) => order.extensionId === extensionId);
-  const hasActiveOrders = extensionOrders.some((order) => order.status === 'pending' || order.status === 'executing');
+  const activeOrders = extensionOrders.filter((order) => isActiveOrderStatus(order.status));
+  const hasActiveOrders = activeOrders.length > 0;
   const [sending, setSending] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [repeat, setRepeat] = useState(1);
   const [repeatProgress, setRepeatProgress] = useState<{ current: number; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -178,10 +213,28 @@ function ExtensionDetailPage({
         await reloadOrders(extensionId);
       }
     } catch (err) {
+      if (err instanceof Error && err.message === ORDER_CANCELLED_MESSAGE) {
+        return;
+      }
       setError(err instanceof Error ? err.message : 'Failed to send order');
     } finally {
       setSending(false);
       setRepeatProgress(null);
+    }
+  };
+
+  const cancelActiveOrder = async () => {
+    const target = activeOrders[0];
+    if (!target) return;
+    setCancelling(true);
+    setError(null);
+    try {
+      await cancelOrder(target.orderId);
+      await reloadOrders(extensionId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to cancel order');
+    } finally {
+      setCancelling(false);
     }
   };
 
@@ -273,7 +326,19 @@ function ExtensionDetailPage({
           </button>
         </form>
         {hasActiveOrders && !sending && (
-          <p className="subtle">This extension is running an order. Wait for it to finish before sending another.</p>
+          <div className="button-row" style={{ marginTop: 12 }}>
+            <button
+              type="button"
+              className="button secondary danger-outline"
+              disabled={cancelling}
+              onClick={() => void cancelActiveOrder()}
+            >
+              {cancelling ? 'Cancelling...' : 'Cancel active withdraw'}
+            </button>
+          </div>
+        )}
+        {hasActiveOrders && !sending && (
+          <p className="subtle">This extension is running an order. Wait for it to finish or cancel it above.</p>
         )}
         {sending && repeatProgress && repeatProgress.total > 1 && (
           <p className="subtle">
@@ -289,7 +354,13 @@ function ExtensionDetailPage({
 
       <section>
         <h2 className="section-title">Orders</h2>
-        <OrderList orders={extensionOrders} />
+        <OrderList
+          orders={extensionOrders}
+          onCancel={async (orderId) => {
+            await cancelOrder(orderId);
+            await reloadOrders(extensionId);
+          }}
+        />
       </section>
     </main>
   );
@@ -299,6 +370,7 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [extensions, setExtensions] = useState<ExtensionRecord[]>([]);
   const [orders, setOrders] = useState<AutomationOrder[]>([]);
+  const [tokenLaunches, setTokenLaunches] = useState<TokenLaunchJob[]>([]);
   const [activity, setActivity] = useState<ActivityItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [activityLoading, setActivityLoading] = useState(true);
@@ -321,6 +393,10 @@ function App() {
     });
   }, []);
 
+  const reloadTokenLaunches = useCallback(async () => {
+    setTokenLaunches(await getTokenLaunchJobs());
+  }, []);
+
   const reloadActivity = useCallback(async () => {
     setActivityLoading(true);
     try {
@@ -336,9 +412,15 @@ function App() {
       socket.emit('dashboard:connect');
     });
     socket.on('disconnect', () => setConnected(false));
-    socket.on('dashboard:connected', (data: { extensions: ExtensionRecord[]; orders: AutomationOrder[]; activity?: ActivityItem[] }) => {
+    socket.on('dashboard:connected', (data: {
+      extensions: ExtensionRecord[];
+      orders: AutomationOrder[];
+      tokenLaunches?: TokenLaunchJob[];
+      activity?: ActivityItem[];
+    }) => {
       setExtensions(data.extensions || []);
       setOrders(data.orders || []);
+      setTokenLaunches(data.tokenLaunches || []);
       setActivity(data.activity || []);
       setLoading(false);
       setActivityLoading(false);
@@ -380,14 +462,28 @@ function App() {
       );
     });
 
+    socket.on('tokenlaunch:created', (data: { job: TokenLaunchJob }) => {
+      setTokenLaunches((current) => upsertById(current, data.job, (j) => j.jobId, data.job.jobId));
+      setActivity((current) =>
+        upsertById(current, ActivityMapper.fromTokenLaunch(data.job), (i) => `${i.kind}:${i.id}`, `token_launch:${data.job.jobId}`)
+      );
+    });
+    socket.on('tokenlaunch:updated', (data: { job: TokenLaunchJob }) => {
+      setTokenLaunches((current) => upsertById(current, data.job, (j) => j.jobId, data.job.jobId));
+      setActivity((current) =>
+        upsertById(current, ActivityMapper.fromTokenLaunch(data.job), (i) => `${i.kind}:${i.id}`, `token_launch:${data.job.jobId}`)
+      );
+    });
+
     void reloadExtensions();
     void reloadOrders();
+    void reloadTokenLaunches();
     void reloadActivity();
 
     return () => {
       socket.disconnect();
     };
-  }, [socket, reloadExtensions, reloadOrders, reloadActivity]);
+  }, [socket, reloadExtensions, reloadOrders, reloadTokenLaunches, reloadActivity]);
 
   return (
     <>
@@ -402,6 +498,10 @@ function App() {
           element={<ExtensionDetailPage extensions={extensions} orders={orders} reloadOrders={reloadOrders} />}
         />
         <Route path="/gmails" element={<GmailsPage />} />
+        <Route
+          path="/tokenlaunch"
+          element={<TokenLaunchPage jobs={tokenLaunches} reloadJobs={reloadTokenLaunches} />}
+        />
         <Route
           path="/orders"
           element={<OrdersPage activity={activity} reload={() => void reloadActivity()} loading={activityLoading} />}

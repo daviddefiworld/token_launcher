@@ -19,7 +19,18 @@ import {
 
 export const BITUNIX_HOST = 'www.bitunix.com';
 export const WITHDRAW_PATH = '/assets/withdraw';
-export const WAIT = { short: 20000, medium: 60000, long: 120000, poll: 500 } as const;
+export const WAIT = { short: 15000, medium: 45000, long: 90000, poll: 250 } as const;
+
+function tokenMatches(selected: string, expected: string): boolean {
+  const normalizedSelected = normalize(selected);
+  const normalizedExpected = normalize(expected);
+  if (!normalizedSelected || !normalizedExpected) return false;
+  if (normalizedSelected === normalizedExpected) return true;
+  return (
+    normalizedSelected.startsWith(`${normalizedExpected} `) ||
+    normalizedSelected.startsWith(`${normalizedExpected}(`)
+  );
+}
 
 function findWithdrawFormRoot(): ParentNode {
   return document.querySelector('#assets-withdraw') || document;
@@ -60,7 +71,7 @@ function isCoinSelected(currency: string): boolean {
 
   const selectedText = readVisibleSelectValue(wrapper);
   if (selectedText) {
-    return selectedText === normalizedCurrency || selectedText.startsWith(`${normalizedCurrency} `);
+    return tokenMatches(selectedText, currency);
   }
 
   return false;
@@ -156,11 +167,6 @@ async function selectCoinViaDropdown(currency: string): Promise<void> {
 async function selectCoin(currency: string): Promise<void> {
   await dismissOpenDropdowns();
 
-  if (isCoinSelected(currency)) {
-    assertCoinSelected(currency);
-    return;
-  }
-
   const hotWorked = await selectCoinViaHotButton(currency);
   if (hotWorked) {
     assertCoinSelected(currency);
@@ -186,16 +192,14 @@ function findNetworkSearchInput(): HTMLInputElement | null {
 
 function isChainSelected(chain: string): boolean {
   const section = findNetworkSection();
-  const normalizedChain = normalize(chain);
   const selectedText = readVisibleSelectValue(section);
   if (selectedText) {
-    return selectedText === normalizedChain || selectedText.includes(normalizedChain);
+    return tokenMatches(selectedText, chain);
   }
 
   const input = findNetworkSearchInput();
   if (!input?.value.trim()) return false;
-  const inputValue = normalize(input.value);
-  return inputValue === normalizedChain || inputValue.includes(normalizedChain);
+  return tokenMatches(input.value, chain);
 }
 
 function assertChainSelected(chain: string): void {
@@ -227,16 +231,13 @@ async function waitForChainListVisible(): Promise<HTMLElement[]> {
 }
 
 function findChainOption(chain: string, options: HTMLElement[]): HTMLElement | null {
-  const normalizedChain = normalize(chain);
   return (
-    options.find((option) => elementText(option) === normalizedChain) ||
-    options.find((option) => elementText(option).includes(normalizedChain)) ||
+    options.find((option) => tokenMatches(elementText(option), chain)) ||
     null
   );
 }
 
 async function selectChain(chain: string, currency: string): Promise<void> {
-  await stepDelay();
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= 6; attempt += 1) {
@@ -290,6 +291,8 @@ async function fillWithdrawAddress(value: string): Promise<void> {
 
   const textarea = await waitFor(() => findWithdrawAddressTextarea(), WAIT.medium);
   clickElement(textarea);
+  setFieldValue(textarea, '', { blur: false });
+  await stepDelay(200);
   setFieldValue(textarea, value, { blur: false });
   await stepDelay();
 
@@ -327,6 +330,8 @@ async function fillAmount(value: string): Promise<void> {
   await stepDelay();
   const input = await waitFor(() => findWithdrawAmountInput(), WAIT.medium);
   clickElement(input);
+  setFieldValue(input, '', { blur: false });
+  await stepDelay(200);
   setFieldValue(input, value, { blur: false });
   await stepDelay();
 
@@ -514,14 +519,25 @@ export async function submitVerification(message: TokenAutomationMessage): Promi
   return successResponse('Bitunix withdraw verification submitted');
 }
 
+async function waitForWithdrawFormReady(): Promise<void> {
+  await waitFor(
+    () => {
+      if (document.readyState !== 'complete' && document.readyState !== 'interactive') return null;
+      return findSymbolSelectWrapper() ? true : null;
+    },
+    WAIT.medium
+  );
+}
+
 export async function runWithdraw(message: TokenAutomationMessage): Promise<AutomationResponse> {
   const request = assertWithdrawRequest(message);
   assertBitunixWithdrawPage();
-  writeStatus('Filling Bitunix withdraw form...');
+  writeStatus(
+    `Withdraw ${request.amount} ${request.currency} on ${request.chain} → ${request.address.slice(0, 10)}…`
+  );
 
-  await waitFor(() => document.readyState === 'complete' || document.readyState === 'interactive', WAIT.medium);
-  await waitFor(() => document.body && document.body.innerText.length > 100, WAIT.long);
-  await stepDelay();
+  await waitForWithdrawFormReady();
+  await stepDelay(200);
 
   await retryStep('Select coin', () => selectCoin(request.currency), writeStatus, 5, () => isCoinSelected(request.currency));
   await retryStep(

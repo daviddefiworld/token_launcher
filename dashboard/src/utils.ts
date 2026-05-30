@@ -1,5 +1,7 @@
 import { getOrders } from './api';
-import type { ActivityItem, AutomationOrder, VerificationCodeRequest } from './types';
+import type { ActivityItem, AutomationOrder, TokenLaunchJob, VerificationCodeRequest } from './types';
+
+export const ORDER_CANCELLED_MESSAGE = 'Order cancelled';
 
 const ACTIVE_ORDER_STATUSES = new Set<AutomationOrder['status']>(['pending', 'executing']);
 
@@ -11,21 +13,26 @@ export async function waitForExtensionIdle(
   extensionId: string,
   options?: { pollMs?: number; maxWaitMs?: number; stableMs?: number }
 ): Promise<void> {
-  const pollMs = options?.pollMs ?? 2000;
-  const stableMs = options?.stableMs ?? 3000;
+  const pollMs = options?.pollMs ?? 1000;
+  const stableMs = options?.stableMs ?? 800;
   const maxWaitMs = options?.maxWaitMs ?? 30 * 60 * 1000;
   const deadline = Date.now() + maxWaitMs;
   let idleSince: number | null = null;
+  let sawActive = false;
 
   while (Date.now() < deadline) {
     const orders = await getOrders(extensionId);
     const hasActive = orders.some((order) => ACTIVE_ORDER_STATUSES.has(order.status));
     if (!hasActive) {
+      if (!sawActive) {
+        return;
+      }
       idleSince ??= Date.now();
       if (Date.now() - idleSince >= stableMs) {
         return;
       }
     } else {
+      sawActive = true;
       idleSince = null;
     }
     await sleep(pollMs);
@@ -48,6 +55,9 @@ export async function waitForOrderCompleted(
     const order = orders.find((item) => item.orderId === orderId);
     if (order?.status === 'completed') {
       return order;
+    }
+    if (order?.status === 'cancelled') {
+      throw new Error(ORDER_CANCELLED_MESSAGE);
     }
     if (order?.status === 'failed') {
       throw new Error(order.error || 'Order failed');
@@ -81,15 +91,20 @@ export function shortId(id: string): string {
 }
 
 export function orderCompletedAt(order: { status: string; output?: { completedAt?: string }; updatedAt: string }): string | undefined {
-  if (order.status !== 'completed' && order.status !== 'failed') return undefined;
+  if (order.status !== 'completed' && order.status !== 'failed' && order.status !== 'cancelled') return undefined;
   return order.output?.completedAt ?? order.updatedAt;
 }
 
 export function orderStatusClass(status: string): string {
   if (status === 'completed') return 'pill success';
   if (status === 'failed') return 'pill danger';
+  if (status === 'cancelled') return 'pill warning';
   if (status === 'executing' || status === 'pending') return 'pill muted';
   return 'pill';
+}
+
+export function isActiveOrderStatus(status: AutomationOrder['status']): boolean {
+  return ACTIVE_ORDER_STATUSES.has(status);
 }
 
 export function formatDuration(ms: number | undefined): string | null {
@@ -155,6 +170,31 @@ export class ActivityMapper {
       message: request.status === 'completed' ? `Code ${request.emailCode}` : undefined,
       createdAt: request.createdAt,
       updatedAt: request.updatedAt
+    };
+  }
+
+  static fromTokenLaunch(job: TokenLaunchJob): ActivityItem {
+    return {
+      id: job.jobId,
+      kind: 'token_launch',
+      extensionId: 'tokenlaunch',
+      status: job.status,
+      title: `Token launch: ${job.input.tokenName}`,
+      summary: `${job.input.lpEthAmount} ETH LP on Base · ${job.phase || job.status}`,
+      tokenLaunch: {
+        tokenName: job.input.tokenName,
+        tokenSymbol: job.input.tokenSymbol,
+        lpEthAmount: job.input.lpEthAmount,
+        buyEthAmount: job.input.buyEthAmount,
+        tokenAddress: job.tokenAddress,
+        poolAddress: job.poolAddress,
+        buyerCount: job.buyerCount,
+        phase: job.phase
+      },
+      error: job.error,
+      message: job.phase,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt
     };
   }
 }

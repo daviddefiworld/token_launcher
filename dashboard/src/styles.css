@@ -190,6 +190,11 @@ h2 {
   color: #64748b;
 }
 
+.pill.warning {
+  background: #fffbeb;
+  color: #b45309;
+}
+
 .url-line {
   background: #f8fafc;
   border-radius: 10px;
@@ -260,6 +265,28 @@ h2 {
 
 .withdraw-form .button {
   grid-column: 1 / -1;
+}
+
+.withdraw-form .checkbox-row {
+  align-items: center;
+  display: flex;
+  font-weight: 600;
+  gap: 8px;
+  grid-column: 1 / -1;
+}
+
+.withdraw-form .checkbox-row input[type='checkbox'] {
+  height: auto;
+  margin: 0;
+  padding: 0;
+  width: auto;
+}
+
+.launch-buy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 4px;
 }
 
 .back-link {

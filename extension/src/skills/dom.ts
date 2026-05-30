@@ -1,13 +1,14 @@
 import type { AutomationResponse, FillableElement } from '../types';
 
-export const POLL_INTERVAL_MS = 500;
+export const POLL_INTERVAL_MS = 250;
 
 export function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-export function stepDelay(): Promise<void> {
-  return delay(1000 + Math.floor(Math.random() * 2000));
+export function stepDelay(ms?: number): Promise<void> {
+  if (ms !== undefined) return delay(ms);
+  return delay(350 + Math.floor(Math.random() * 250));
 }
 
 export async function waitFor<T>(

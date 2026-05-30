@@ -4,8 +4,15 @@ import type {
   CachedGmailMessage,
   ExtensionRecord,
   GmailAccount,
-  GmailStatus
+  GmailStatus,
+  TokenLaunchInput,
+  TokenLaunchJob,
+  TokenLaunchStatusResponse,
+  UnremovedLpPosition,
+  LpRemovalResult
 } from './types';
+
+export type { TokenLaunchInput };
 
 export interface WithdrawOrderInput {
   currency: string;
@@ -51,6 +58,57 @@ class BackendClient {
 
   createOrder(extensionId: string, input: WithdrawOrderInput): Promise<AutomationOrder> {
     return this.readJson(`/api/extensions/${encodeURIComponent(extensionId)}/orders`, {
+      method: 'POST',
+      body: JSON.stringify(input)
+    });
+  }
+
+  cancelOrder(orderId: string): Promise<AutomationOrder> {
+    return this.readJson(`/api/orders/${encodeURIComponent(orderId)}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify({})
+    });
+  }
+
+  getTokenLaunchStatus(): Promise<TokenLaunchStatusResponse> {
+    return this.readJson('/api/tokenlaunch/status');
+  }
+
+  getTokenLaunchJobs(): Promise<TokenLaunchJob[]> {
+    return this.readJson('/api/tokenlaunch');
+  }
+
+  startTokenLaunch(input: TokenLaunchInput): Promise<TokenLaunchJob> {
+    return this.readJson('/api/tokenlaunch', {
+      method: 'POST',
+      body: JSON.stringify(input)
+    });
+  }
+
+  manualTokenLaunchBuy(
+    jobId: string,
+    wallet: 2 | 3,
+    ethAmount?: string
+  ): Promise<TokenLaunchJob> {
+    return this.readJson(`/api/tokenlaunch/${encodeURIComponent(jobId)}/buy`, {
+      method: 'POST',
+      body: JSON.stringify(ethAmount ? { wallet, ethAmount } : { wallet })
+    });
+  }
+
+  finishTokenLaunch(jobId: string): Promise<TokenLaunchJob> {
+    return this.readJson(`/api/tokenlaunch/${encodeURIComponent(jobId)}/finish`, {
+      method: 'POST',
+      body: JSON.stringify({})
+    });
+  }
+
+  getUnremovedLp(): Promise<UnremovedLpPosition[]> {
+    return this.readJson('/api/tokenlaunch/lp/unremoved');
+  }
+
+  removeUnremovedLp(input: { poolAddress: string } | { all: true }): Promise<LpRemovalResult[]> {
+    return this.readJson('/api/tokenlaunch/lp/remove', {
       method: 'POST',
       body: JSON.stringify(input)
     });
@@ -106,6 +164,16 @@ export const getExtensions = () => client.getExtensions();
 export const getOrders = (extensionId?: string) => client.getOrders(extensionId);
 export const getActivity = (extensionId?: string) => client.getActivity(extensionId);
 export const createOrder = (extensionId: string, input: WithdrawOrderInput) => client.createOrder(extensionId, input);
+export const cancelOrder = (orderId: string) => client.cancelOrder(orderId);
+export const getTokenLaunchStatus = () => client.getTokenLaunchStatus();
+export const getTokenLaunchJobs = () => client.getTokenLaunchJobs();
+export const startTokenLaunch = (input: TokenLaunchInput) => client.startTokenLaunch(input);
+export const manualTokenLaunchBuy = (jobId: string, wallet: 2 | 3, ethAmount?: string) =>
+  client.manualTokenLaunchBuy(jobId, wallet, ethAmount);
+export const finishTokenLaunch = (jobId: string) => client.finishTokenLaunch(jobId);
+export const getUnremovedLp = () => client.getUnremovedLp();
+export const removeUnremovedLp = (input: { poolAddress: string } | { all: true }) =>
+  client.removeUnremovedLp(input);
 export const getGmailStatus = () => client.getGmailStatus();
 export const getGmailAccounts = () => client.getGmailAccounts();
 export const getGmailMessages = (accountId?: string) => client.getGmailMessages(accountId);

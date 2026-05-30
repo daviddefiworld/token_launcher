@@ -1,15 +1,19 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import type { ActivityItem } from '../types';
-import { formatDuration, formatUtcTime, shortId } from '../utils';
+import { cancelOrder } from '../api';
+import type { ActivityItem, AutomationOrder } from '../types';
+import { formatDuration, formatUtcTime, isActiveOrderStatus, shortId } from '../utils';
 
 function kindLabel(kind: ActivityItem['kind']): string {
-  return kind === 'email_verification' ? 'Email check' : 'Withdraw';
+  if (kind === 'email_verification') return 'Email check';
+  if (kind === 'token_launch') return 'Token launch';
+  return 'Withdraw';
 }
 
 function statusClass(status: string): string {
   if (status === 'completed') return 'pill success';
   if (status === 'failed') return 'pill danger';
+  if (status === 'cancelled') return 'pill warning';
   if (status === 'executing' || status === 'pending') return 'pill muted';
   return 'pill';
 }
@@ -24,7 +28,22 @@ export function OrdersPage({
   loading: boolean;
 }) {
   const [filter, setFilter] = useState<'all' | ActivityItem['kind']>('all');
+  const [cancelBusy, setCancelBusy] = useState<string | null>(null);
+  const [cancelError, setCancelError] = useState<string | null>(null);
   const filtered = filter === 'all' ? activity : activity.filter((item) => item.kind === filter);
+
+  const handleCancel = async (orderId: string) => {
+    setCancelBusy(orderId);
+    setCancelError(null);
+    try {
+      await cancelOrder(orderId);
+      reload();
+    } catch (err) {
+      setCancelError(err instanceof Error ? err.message : 'Failed to cancel order');
+    } finally {
+      setCancelBusy(null);
+    }
+  };
 
   return (
     <main className="page">
@@ -32,7 +51,7 @@ export function OrdersPage({
         <div>
           <p className="eyebrow">Activity log</p>
           <h1>Orders</h1>
-          <p className="subtle">Withdraw orders and Gmail verification code lookups from the extension.</p>
+          <p className="subtle">Withdraw orders, token launches, and Gmail verification lookups.</p>
         </div>
         <button type="button" className="button secondary" onClick={reload} disabled={loading}>
           Refresh
@@ -57,7 +76,16 @@ export function OrdersPage({
         >
           Email check
         </button>
+        <button
+          type="button"
+          className={`button secondary${filter === 'token_launch' ? ' active-filter' : ''}`}
+          onClick={() => setFilter('token_launch')}
+        >
+          Token launch
+        </button>
       </div>
+
+      {cancelError && <p className="error">{cancelError}</p>}
 
       {loading ? (
         <div className="empty">Loading orders...</div>
@@ -92,6 +120,18 @@ export function OrdersPage({
               {item.message && item.kind === 'withdraw' && <p className="result">{item.message}</p>}
               {item.pageUrl && <p className="url-line">{item.pageUrl}</p>}
               {item.error && <p className="error">{item.error}</p>}
+              {item.kind === 'withdraw' && isActiveOrderStatus(item.status as AutomationOrder['status']) && (
+                <div className="button-row" style={{ marginTop: 12 }}>
+                  <button
+                    type="button"
+                    className="button secondary danger-outline"
+                    disabled={cancelBusy === item.id}
+                    onClick={() => void handleCancel(item.id)}
+                  >
+                    {cancelBusy === item.id ? 'Cancelling...' : 'Cancel withdraw'}
+                  </button>
+                </div>
+              )}
             </article>
           ))}
         </div>

@@ -3,9 +3,9 @@ import { io, Socket } from 'socket.io-client';
 const DEFAULT_BACKEND_URL = 'http://localhost:5050';
 const BITUNIX_WITHDRAW_URL = 'https://www.bitunix.com/assets/withdraw';
 const BITUNIX_WALLET_URL = 'https://www.bitunix.com/assets/overview';
-const POST_SUCCESS_WALLET_DELAY_MS = 30_000;
+const POST_SUCCESS_WALLET_DELAY_MS = 5_000;
 const ORDER_TIMEOUT_MS = 5 * 60 * 1000;
-const SLOW_PAGE_TIMEOUT_MS = 120000;
+const SLOW_PAGE_TIMEOUT_MS = 60000;
 const EMAIL_CODE_WAIT_TIMEOUT_MS = 190000;
 const STORAGE_KEYS = {
   backendUrl: 'tokenAutomationBackendUrl',
@@ -43,8 +43,12 @@ interface ContentPingResponse {
 let socket: Socket | null = null;
 let extensionId = '';
 let runningOrderId: string | null = null;
+let lastBitunixTabId: number | undefined;
 const orderQueue: RunOrderPayload[] = [];
+const cancelledOrderIds = new Set<string>();
 let drainingOrderQueue = false;
+
+const ORDER_CANCELLED_MESSAGE = 'Order cancelled';
 
 const backendInput = document.getElementById('backend-url') as HTMLInputElement;
 const saveButton = document.getElementById('save-backend') as HTMLButtonElement;
@@ -119,6 +123,62 @@ function updateTab(tabId: number, properties: chrome.tabs.UpdateProperties): Pro
       resolve(tab);
     });
   });
+}
+
+function queryTabs(query: chrome.tabs.QueryInfo): Promise<chrome.tabs.Tab[]> {
+  return new Promise((resolve) => chrome.tabs.query(query, resolve));
+}
+
+async function findBitunixTab(): Promise<chrome.tabs.Tab | null> {
+  const tabs = await queryTabs({ url: ['*://www.bitunix.com/*'] });
+  return (
+    tabs.find((tab) => isBitunixWithdrawUrl(tab.url)) ||
+    tabs.find((tab) => tab.url?.includes('/assets/')) ||
+    tabs[0] ||
+    null
+  );
+}
+
+async function resolveWithdrawTab(): Promise<chrome.tabs.Tab> {
+  if (lastBitunixTabId !== undefined) {
+    try {
+      const tab = await getTab(lastBitunixTabId);
+      if (tab.id && tab.url && /bitunix\.com/i.test(tab.url)) {
+        return tab;
+      }
+    } catch {
+      lastBitunixTabId = undefined;
+    }
+  }
+
+  const bitunixTab = await findBitunixTab();
+  if (bitunixTab?.id) {
+    return bitunixTab;
+  }
+
+  return getActiveTab();
+}
+
+async function waitForWithdrawPageReady(tabId: number, timeoutMs = SLOW_PAGE_TIMEOUT_MS): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const tab = await getTab(tabId);
+      if (isBitunixWithdrawUrl(tab.url)) {
+        if (await pingContent(tabId)) {
+          return;
+        }
+        await injectContent(tabId);
+        if (await pingContent(tabId)) {
+          return;
+        }
+      }
+    } catch {
+      // Tab may still be loading.
+    }
+    await delay(250);
+  }
+  throw new Error('Timed out waiting for the withdraw page');
 }
 
 function waitForTabComplete(tabId: number, timeoutMs = SLOW_PAGE_TIMEOUT_MS): Promise<void> {
@@ -222,13 +282,16 @@ async function ensureWithdrawTab(tab: chrome.tabs.Tab): Promise<chrome.tabs.Tab>
   }
 
   if (isBitunixWithdrawUrl(tab.url)) {
+    await updateTab(tab.id, { active: true });
+    lastBitunixTabId = tab.id;
     return tab;
   }
 
   setMessage('Opening Bitunix withdraw page...');
-  const updated = await updateTab(tab.id, { url: BITUNIX_WITHDRAW_URL, active: true });
-  await waitForTabComplete(tab.id);
-  return getTab(updated.id || tab.id);
+  await updateTab(tab.id, { url: BITUNIX_WITHDRAW_URL, active: true });
+  await waitForWithdrawPageReady(tab.id);
+  lastBitunixTabId = tab.id;
+  return getTab(tab.id);
 }
 
 function sendToContent(
@@ -278,6 +341,11 @@ function requestVerificationCodeFromBackend(orderId: string, emailCodeSentAt: nu
       return;
     }
 
+    if (isOrderCancelled(orderId)) {
+      reject(new Error(ORDER_CANCELLED_MESSAGE));
+      return;
+    }
+
     const timeoutId = window.setTimeout(() => {
       cleanup();
       reject(new Error('Timed out waiting for Bitunix verification email from backend'));
@@ -286,6 +354,10 @@ function requestVerificationCodeFromBackend(orderId: string, emailCodeSentAt: nu
     const onReady = (data: { orderId?: string; emailCode?: string }) => {
       if (data.orderId !== orderId || !data.emailCode?.trim()) return;
       cleanup();
+      if (isOrderCancelled(orderId)) {
+        reject(new Error(ORDER_CANCELLED_MESSAGE));
+        return;
+      }
       resolve(data.emailCode.trim());
     };
 
@@ -295,14 +367,22 @@ function requestVerificationCodeFromBackend(orderId: string, emailCodeSentAt: nu
       reject(new Error(data.error || 'Backend could not find verification email'));
     };
 
+    const onCancel = (data: { orderId?: string }) => {
+      if (data.orderId !== orderId) return;
+      cleanup();
+      reject(new Error(ORDER_CANCELLED_MESSAGE));
+    };
+
     function cleanup(): void {
       window.clearTimeout(timeoutId);
       socket?.off('extension:verification_code_ready', onReady);
       socket?.off('extension:verification_code_failed', onFailed);
+      socket?.off('extension:cancel_order', onCancel);
     }
 
     socket.on('extension:verification_code_ready', onReady);
     socket.on('extension:verification_code_failed', onFailed);
+    socket.on('extension:cancel_order', onCancel);
 
     socket.emit(
       'extension:request_verification_code',
@@ -370,6 +450,28 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function isOrderCancelled(orderId: string): boolean {
+  return cancelledOrderIds.has(orderId);
+}
+
+function assertOrderActive(orderId: string): void {
+  if (isOrderCancelled(orderId)) {
+    throw new Error(ORDER_CANCELLED_MESSAGE);
+  }
+}
+
+function cancelLocalOrder(orderId: string): void {
+  cancelledOrderIds.add(orderId);
+  for (let index = orderQueue.length - 1; index >= 0; index -= 1) {
+    if (orderQueue[index]?.orderId === orderId) {
+      orderQueue.splice(index, 1);
+    }
+  }
+  if (runningOrderId === orderId) {
+    setMessage(`Order ${orderId.slice(0, 8)} stopping…`);
+  }
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = window.setTimeout(() => reject(new Error(message)), ms);
@@ -390,15 +492,22 @@ async function executeWithdrawOrder(
   payload: RunOrderPayload,
   setBitunixTabId: (tabId: number) => void
 ): Promise<ContentOrderResponse> {
-  const tab = await getActiveTab();
+  assertOrderActive(payload.orderId);
+  setMessage(`Starting order ${payload.orderId.slice(0, 8)}…`);
+  const tab = await resolveWithdrawTab();
+  assertOrderActive(payload.orderId);
   const withdrawTab = await ensureWithdrawTab(tab);
+  assertOrderActive(payload.orderId);
   const tabId = await ensureContentScript(withdrawTab);
+  lastBitunixTabId = tabId;
   setBitunixTabId(tabId);
   let result = await sendToContent(tabId, 'tokenAutomationOrder', payload);
 
   if (result.verificationRequired) {
+    assertOrderActive(payload.orderId);
     const emailCodeSentAt = result.emailCodeSentAt || Date.now();
     const emailCode = await resolveEmailCode(payload.orderId, emailCodeSentAt, payload.emailCode || result.emailCode);
+    assertOrderActive(payload.orderId);
     const authenticatorCode = await readAuthenticatorCode(payload.authenticatorCode);
 
     showVerificationCodes(emailCode, authenticatorCode);
@@ -406,6 +515,7 @@ async function executeWithdrawOrder(
 
     await updateTab(tabId, { active: true });
     await waitForTabComplete(tabId).catch(() => undefined);
+    assertOrderActive(payload.orderId);
     await ensureContentScript(await getTab(tabId));
 
     result = await sendToContent(tabId, 'tokenAutomationCompleteVerification', {
@@ -415,6 +525,7 @@ async function executeWithdrawOrder(
     });
   }
 
+  assertOrderActive(payload.orderId);
   return result;
 }
 
@@ -432,6 +543,10 @@ async function moveToBitunixWallet(tabId?: number, statusMessage = 'Opening Bitu
 }
 
 async function runOrder(payload: RunOrderPayload): Promise<void> {
+  if (isOrderCancelled(payload.orderId)) {
+    return;
+  }
+
   lastOrderEl.textContent = payload.orderId.slice(0, 8);
   hideVerificationCodes();
   setMessage('Running Bitunix withdraw order...');
@@ -446,24 +561,38 @@ async function runOrder(payload: RunOrderPayload): Promise<void> {
       ORDER_TIMEOUT_MS,
       'Order timed out after 5 minutes'
     );
-    setMessage('Withdraw complete. Waiting before opening wallet...');
-    await delay(POST_SUCCESS_WALLET_DELAY_MS);
-    await moveToBitunixWallet(bitunixTabId, 'Opening Bitunix wallet...');
+
+    if (isOrderCancelled(payload.orderId)) {
+      setMessage('Withdraw cancelled.');
+      return;
+    }
 
     socket?.emit('extension:order_result', {
       orderId: payload.orderId,
       status: 'completed',
       output: result
     });
+
+    setMessage('Withdraw complete.');
+    if (orderQueue.length === 0) {
+      void (async () => {
+        await delay(POST_SUCCESS_WALLET_DELAY_MS);
+        await moveToBitunixWallet(bitunixTabId, 'Opening Bitunix wallet...');
+      })();
+    }
   } catch (error) {
+    if (isOrderCancelled(payload.orderId) || (error instanceof Error && error.message === ORDER_CANCELLED_MESSAGE)) {
+      setMessage('Withdraw cancelled.');
+      return;
+    }
     const message = error instanceof Error ? error.message : 'Order failed';
     setMessage(message);
-    await moveToBitunixWallet(bitunixTabId, 'Withdraw failed. Opening Bitunix wallet...');
     socket?.emit('extension:order_result', {
       orderId: payload.orderId,
       status: 'failed',
       error: message
     });
+    void moveToBitunixWallet(bitunixTabId, 'Withdraw failed. Opening Bitunix wallet...');
   }
 }
 
@@ -473,6 +602,9 @@ async function drainOrderQueue(): Promise<void> {
   try {
     while (orderQueue.length > 0) {
       const payload = orderQueue.shift()!;
+      if (isOrderCancelled(payload.orderId)) {
+        continue;
+      }
       runningOrderId = payload.orderId;
       try {
         await runOrder(payload);
@@ -489,7 +621,13 @@ async function drainOrderQueue(): Promise<void> {
 }
 
 function enqueueOrder(payload: RunOrderPayload): void {
+  if (isOrderCancelled(payload.orderId)) {
+    return;
+  }
   orderQueue.push(payload);
+  if (runningOrderId) {
+    setMessage(`Order ${payload.orderId.slice(0, 8)} queued (${orderQueue.length} waiting)…`);
+  }
   void drainOrderQueue();
 }
 
@@ -543,6 +681,13 @@ async function connect(): Promise<void> {
 
   socket.on('extension:run_order', (payload: RunOrderPayload) => {
     enqueueOrder(payload);
+  });
+
+  socket.on('extension:cancel_order', (data: { orderId?: string }) => {
+    const orderId = data.orderId?.trim();
+    if (!orderId) return;
+    cancelLocalOrder(orderId);
+    setMessage(`Order ${orderId.slice(0, 8)} cancelled.`);
   });
 }
 
