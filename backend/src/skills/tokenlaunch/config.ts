@@ -171,5 +171,29 @@ export const aerodromePoolAbi = [
       { name: 'spender', type: 'address' }
     ],
     outputs: [{ type: 'uint256' }]
+  },
+  {
+    type: 'function',
+    name: 'claimFees',
+    stateMutability: 'nonpayable',
+    inputs: [],
+    outputs: [
+      { name: 'claimed0', type: 'uint256' },
+      { name: 'claimed1', type: 'uint256' }
+    ]
+  },
+  {
+    type: 'function',
+    name: 'claimable0',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ type: 'uint256' }]
+  },
+  {
+    type: 'function',
+    name: 'claimable1',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ type: 'uint256' }]
   }
 ] as const;

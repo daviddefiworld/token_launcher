@@ -312,9 +312,9 @@ export class TokenAutomationApp {
   private tokenLaunchRoutes(): Router {
     const router = Router();
 
-    router.get('/status', (_req, res) => {
+    router.get('/status', async (_req, res) => {
       try {
-        res.json({ success: true, data: this.tokenLaunch.getStatus() });
+        res.json({ success: true, data: await this.tokenLaunch.getStatus() });
       } catch (error) {
         res.status(503).json({ success: false, error: error instanceof Error ? error.message : 'Token launch unavailable' });
       }

@@ -50,6 +50,7 @@ import { launchTokenAbi, launchTokenBytecode } from './contracts';
 export type TokenLaunchBroadcast = (job: TokenLaunchJob, event: 'created' | 'updated') => void;
 
 const MAX_REPEAT_COUNT = 50;
+const REPEAT_DELAY_MS = 3_000;
 const LP_SCAN_DELAY_MS = 800;
 const TRADES_BACKFILL_JOB_DELAY_MS = 1_200;
 const TRADES_BACKFILL_START_DELAY_MS = 8_000;
@@ -227,14 +228,17 @@ export class TokenLaunchService {
     this.wallet3Address = null;
   }
 
-  getStatus(): {
+  async getStatus(): Promise<{
     configured: boolean;
     wallet1Address?: string;
     wallet2Address?: string;
     wallet3Address?: string;
+    wallet1BalanceEth?: string;
+    wallet2BalanceEth?: string;
+    wallet3BalanceEth?: string;
     wallet3Configured: boolean;
     rpcUrl: string;
-  } {
+  }> {
     const rpcUrl = process.env.BASE_RPC_URL?.trim() || 'https://mainnet.base.org';
     const keys = this.resolveWalletKeys();
     if (!keys.wallet1 || !keys.wallet2) {
@@ -247,13 +251,43 @@ export class TokenLaunchService {
       return { configured: false, wallet3Configured: Boolean(keys.wallet3), rpcUrl };
     }
 
+    const balances = await this.fetchWalletBalances();
+
     return {
       configured: true,
       wallet1Address: this.wallet1Address ?? undefined,
       wallet2Address: this.wallet2Address ?? undefined,
       wallet3Address: this.wallet3Address ?? undefined,
+      wallet1BalanceEth: balances.wallet1,
+      wallet2BalanceEth: balances.wallet2,
+      wallet3BalanceEth: balances.wallet3,
       wallet3Configured: Boolean(keys.wallet3),
       rpcUrl
+    };
+  }
+
+  private formatEthBalance(wei: bigint): string {
+    return (Number(wei) / 1e18).toFixed(6);
+  }
+
+  private async fetchWalletBalances(): Promise<{
+    wallet1?: string;
+    wallet2?: string;
+    wallet3?: string;
+  }> {
+    const client = this.publicClient;
+    if (!client || !this.wallet1Address || !this.wallet2Address) return {};
+
+    const [wallet1Wei, wallet2Wei, wallet3Wei] = await Promise.all([
+      client.getBalance({ address: this.wallet1Address }),
+      client.getBalance({ address: this.wallet2Address }),
+      this.wallet3Address ? client.getBalance({ address: this.wallet3Address }) : Promise.resolve(null)
+    ]);
+
+    return {
+      wallet1: this.formatEthBalance(wallet1Wei),
+      wallet2: this.formatEthBalance(wallet2Wei),
+      wallet3: wallet3Wei !== null ? this.formatEthBalance(wallet3Wei) : undefined
     };
   }
 
@@ -400,8 +434,7 @@ export class TokenLaunchService {
       throw new Error('Only active launches can be finished');
     }
 
-    this.repeatRemaining = 0;
-    this.repeatInput = null;
+    this.clearRepeatBatch();
     const updated = this.patch(jobId, {
       status: 'completed',
       phase: 'Finished manually',
@@ -483,19 +516,45 @@ export class TokenLaunchService {
     return job;
   }
 
-  private scheduleNextRepeat(): void {
+  private isLaunchReadyForNextRepeat(job: TokenLaunchJob | undefined): boolean {
+    if (!job || job.status !== 'completed') return false;
+    if (job.input.removeLp !== false && !job.lpRemoved) return false;
+    return true;
+  }
+
+  private clearRepeatBatch(): void {
+    this.repeatRemaining = 0;
+    this.repeatInput = null;
+  }
+
+  private async maybeScheduleNextRepeat(jobId: string): Promise<void> {
+    if (this.repeatRemaining <= 0 || !this.repeatInput) return;
+
+    const job = this.repository.get(jobId);
+    if (!this.isLaunchReadyForNextRepeat(job)) {
+      console.warn(
+        `Token launch repeat batch stopped: job ${jobId.slice(0, 8)}… did not fully complete` +
+          (job?.input.removeLp !== false && !job?.lpRemoved ? ' (LP not removed)' : '') +
+          `.`
+      );
+      this.clearRepeatBatch();
+      return;
+    }
+
     if (this.repeatRemaining <= 1) {
-      this.repeatRemaining = 0;
-      this.repeatInput = null;
+      this.clearRepeatBatch();
       return;
     }
 
     this.repeatRemaining -= 1;
+    await sleep(REPEAT_DELAY_MS);
+
+    if (this.repeatRemaining <= 0 || !this.repeatInput) return;
+
     try {
       this.startNextRepeat();
     } catch (error) {
-      this.repeatRemaining = 0;
-      this.repeatInput = null;
+      this.clearRepeatBatch();
       console.error('Failed to start next token launch repeat:', formatViemError(error));
     }
   }
@@ -907,7 +966,7 @@ export class TokenLaunchService {
       this.fail(jobId, error);
     } finally {
       this.running.delete(jobId);
-      this.scheduleNextRepeat();
+      void this.maybeScheduleNextRepeat(jobId);
     }
   }
 
@@ -1137,6 +1196,8 @@ export class TokenLaunchService {
     )) as bigint;
     if (lpBalance <= 0n) return null;
 
+    await this.claimPoolFees(publicClient, wallet1, wallet1Account, wallet1Address, poolAddress);
+
     const allowance = (await withRpcRetry(`LP allowance for ${poolAddress}`, () =>
       publicClient.readContract({
         address: poolAddress,
@@ -1201,6 +1262,44 @@ export class TokenLaunchService {
     }
 
     return removeHash;
+  }
+
+  private async claimPoolFees(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    publicClient: any,
+    wallet1: WalletClient,
+    wallet1Account: NonNullable<TokenLaunchService['wallet1Account']>,
+    wallet1Address: Address,
+    poolAddress: Address
+  ): Promise<void> {
+    try {
+      const claimGas = await this.estimateWriteGas(
+        publicClient,
+        {
+          account: wallet1Address,
+          address: poolAddress,
+          abi: aerodromePoolAbi,
+          functionName: 'claimFees'
+        },
+        120_000n
+      );
+      const claimHash = await wallet1.writeContract({
+        account: wallet1Account,
+        chain: BASE_CHAIN,
+        address: poolAddress,
+        abi: aerodromePoolAbi,
+        functionName: 'claimFees',
+        gas: claimGas
+      });
+      const claimReceipt = await publicClient.waitForTransactionReceipt({ hash: claimHash });
+      if (claimReceipt.status !== 'success') {
+        console.warn(
+          receiptFailureMessage('Claim LP fees transaction failed', claimReceipt, claimHash)
+        );
+      }
+    } catch (error) {
+      console.warn(`LP fee claim failed for pool ${poolAddress}:`, formatViemError(error));
+    }
   }
 }
 

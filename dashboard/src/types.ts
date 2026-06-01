@@ -169,6 +169,9 @@ export interface TokenLaunchStatusResponse {
   wallet1Address?: string;
   wallet2Address?: string;
   wallet3Address?: string;
+  wallet1BalanceEth?: string;
+  wallet2BalanceEth?: string;
+  wallet3BalanceEth?: string;
   wallet3Configured?: boolean;
   rpcUrl: string;
 }

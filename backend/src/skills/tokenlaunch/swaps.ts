@@ -2,10 +2,12 @@ import { decodeEventLog, formatEther, getAddress, type Address } from 'viem';
 import type { LaunchTradeStats, PoolTrade } from '../../types';
 
 export type { LaunchTradeStats };
-import { aerodromePoolAbi } from './config';
+import { AERODROME, aerodromePoolAbi } from './config';
 
 const LOG_CHUNK_BLOCKS = 2_000n;
 const CHUNK_DELAY_MS = 400;
+
+const PROTOCOL_ADDRESSES = new Set<string>([AERODROME.router.toLowerCase()]);
 
 export function tradeKey(trade: PoolTrade): string {
   return `${trade.txHash}:${trade.logIndex}`;
@@ -21,10 +23,18 @@ export function mergeTrades(existing: PoolTrade[], incoming: PoolTrade[]): PoolT
   );
 }
 
+function isExternalTrader(trade: PoolTrade): boolean {
+  return (
+    !trade.isOwnWallet &&
+    trade.side === 'buy' &&
+    !PROTOCOL_ADDRESSES.has(trade.trader.toLowerCase())
+  );
+}
+
 export function countExternalBuyersFromTrades(trades: PoolTrade[]): number {
   const buyers = new Set<string>();
   for (const trade of trades) {
-    if (trade.side === 'buy' && !trade.isOwnWallet) {
+    if (isExternalTrader(trade)) {
       buyers.add(trade.trader.toLowerCase());
     }
   }
@@ -42,8 +52,13 @@ export function computeTradeStats(trades: PoolTrade[]): LaunchTradeStats {
     if (trade.side === 'buy') buys += 1;
     else sells += 1;
     if (trade.isOwnWallet) ownWalletSwaps += 1;
-    else if (trade.side === 'buy') externalBuyers.add(trade.trader.toLowerCase());
-    else externalSellers.add(trade.trader.toLowerCase());
+    else if (isExternalTrader(trade)) externalBuyers.add(trade.trader.toLowerCase());
+    else if (
+      trade.side === 'sell' &&
+      !PROTOCOL_ADDRESSES.has(trade.trader.toLowerCase())
+    ) {
+      externalSellers.add(trade.trader.toLowerCase());
+    }
   }
 
   return {
@@ -63,19 +78,27 @@ function sleep(ms: number): Promise<void> {
 function resolveTrader(
   sender: Address,
   to: Address,
-  ourWallets: Set<string>
+  side: PoolTrade['side'],
+  ourWallets: Set<string>,
+  protocolAddresses: Set<string> = PROTOCOL_ADDRESSES
 ): { trader: Address; isOwnWallet: boolean } {
   const senderLower = sender.toLowerCase();
   const toLower = to.toLowerCase();
-  const senderOurs = ourWallets.has(senderLower);
-  const toOurs = ourWallets.has(toLower);
+  const senderIsProtocol = protocolAddresses.has(senderLower);
+  const toIsProtocol = protocolAddresses.has(toLower);
 
-  if (!senderOurs && !toOurs) {
-    return { trader: getAddress(to), isOwnWallet: false };
+  let trader: Address;
+  if (side === 'buy') {
+    // Router-mediated buys deliver tokens to `to`; ignore the router as sender.
+    trader = !toIsProtocol ? getAddress(to) : !senderIsProtocol ? getAddress(sender) : getAddress(to);
+  } else {
+    trader = !senderIsProtocol ? getAddress(sender) : !toIsProtocol ? getAddress(to) : getAddress(sender);
   }
-  if (!senderOurs) return { trader: getAddress(sender), isOwnWallet: false };
-  if (!toOurs) return { trader: getAddress(to), isOwnWallet: false };
-  return { trader: getAddress(sender), isOwnWallet: true };
+
+  return {
+    trader,
+    isOwnWallet: ourWallets.has(trader.toLowerCase())
+  };
 }
 
 type RawSwapLog = {
@@ -133,7 +156,7 @@ function decodeSwapLog(
       ? amount0In
       : amount0Out;
 
-  const { trader, isOwnWallet } = resolveTrader(sender, to, ourWallets);
+  const { trader, isOwnWallet } = resolveTrader(sender, to, side, ourWallets);
   const blockNumber = Number(log.blockNumber);
 
   return {

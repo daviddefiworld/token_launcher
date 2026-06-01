@@ -23,7 +23,7 @@ const DEFAULT_TOKEN_LAUNCH: TokenLaunchInput = {
   repeatCount: 1,
   removeLp: true,
   removeLpTimeMinutes: 5,
-  minBuyersBeforeRemoveLp: 1
+  minBuyersBeforeRemoveLp: 2
 };
 
 const ACTIVE_STATUSES: LaunchWorkflowStatus[] = [

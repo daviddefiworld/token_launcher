@@ -75,6 +75,9 @@ export function TokenLaunchPage({
   const [wallet1Address, setWallet1Address] = useState<string>();
   const [wallet2Address, setWallet2Address] = useState<string>();
   const [wallet3Address, setWallet3Address] = useState<string>();
+  const [wallet1BalanceEth, setWallet1BalanceEth] = useState<string>();
+  const [wallet2BalanceEth, setWallet2BalanceEth] = useState<string>();
+  const [wallet3BalanceEth, setWallet3BalanceEth] = useState<string>();
   const [wallet3Configured, setWallet3Configured] = useState(false);
   const [rpcUrl, setRpcUrl] = useState('https://mainnet.base.org');
   const [input, setInput] = useState<TokenLaunchInput>(DEFAULT_INPUT);
@@ -106,6 +109,9 @@ export function TokenLaunchPage({
       setWallet1Address(status.wallet1Address);
       setWallet2Address(status.wallet2Address);
       setWallet3Address(status.wallet3Address);
+      setWallet1BalanceEth(status.wallet1BalanceEth);
+      setWallet2BalanceEth(status.wallet2BalanceEth);
+      setWallet3BalanceEth(status.wallet3BalanceEth);
       setWallet3Configured(Boolean(status.wallet3Configured));
       setRpcUrl(status.rpcUrl);
     } catch (err) {
@@ -260,11 +266,18 @@ export function TokenLaunchPage({
         ) : configured ? (
           <>
             <p className="subtle">RPC: {rpcUrl}</p>
-            <p className="mono subtle">Wallet 1 (deploy + LP): {wallet1Address}</p>
-            <p className="mono subtle">Wallet 2 (buy): {wallet2Address}</p>
+            <p className="mono subtle">
+              Wallet 1 (deploy + LP): {wallet1Address}
+              {wallet1BalanceEth ? ` · ${wallet1BalanceEth} ETH` : ''}
+            </p>
+            <p className="mono subtle">
+              Wallet 2 (buy): {wallet2Address}
+              {wallet2BalanceEth ? ` · ${wallet2BalanceEth} ETH` : ''}
+            </p>
             <p className="mono subtle">
               Wallet 3 (optional buy):{' '}
               {wallet3Configured ? wallet3Address : 'not configured — set WALLET_3_PRIVATE_KEY to enable'}
+              {wallet3Configured && wallet3BalanceEth ? ` · ${wallet3BalanceEth} ETH` : ''}
             </p>
           </>
         ) : (
@@ -482,7 +495,7 @@ export function TokenLaunchPage({
       </section>
 
       {(manualBuyError || finishError) && (
-        <p className="error" style={{ marginBottom: 12 }}>
+        <p className="error page-banner-error" style={{ marginBottom: 12 }}>
           {manualBuyError || finishError}
         </p>
       )}

@@ -10,6 +10,7 @@
 
 body {
   margin: 0;
+  overflow-x: clip;
 }
 
 a {
@@ -34,7 +35,9 @@ a {
   align-items: center;
   display: flex;
   flex: 1;
+  flex-wrap: wrap;
   gap: 16px;
+  min-width: 0;
 }
 
 .topbar-nav a {
@@ -55,6 +58,8 @@ a {
 .page {
   margin: 0 auto;
   max-width: 1120px;
+  min-width: 0;
+  overflow-x: clip;
   padding: 32px 24px;
 }
 
@@ -163,6 +168,16 @@ h2 {
   display: flex;
   gap: 12px;
   justify-content: space-between;
+  min-width: 0;
+}
+
+.card-title-row > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.card-title-row > .pill {
+  flex-shrink: 0;
 }
 
 .pill {
@@ -313,6 +328,8 @@ h2 {
 }
 
 .order-card {
+  min-width: 0;
+  overflow-wrap: anywhere;
   padding: 16px;
 }
 
@@ -321,6 +338,7 @@ h2 {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   font-size: 12px;
   margin: 8px 0 0;
+  overflow-wrap: anywhere;
 }
 
 .result {
@@ -338,6 +356,19 @@ h2 {
   color: #b91c1c;
   font-size: 14px;
   margin: 10px 0 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.order-card .error,
+.page-banner-error {
+  background: #fef2f2;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.45;
+  max-height: 5.5rem;
+  overflow-y: auto;
+  padding: 8px 10px;
 }
 
 .analyzer-stats {
