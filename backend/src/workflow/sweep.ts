@@ -1,5 +1,6 @@
-import { createPublicClient, createWalletClient, getAddress, http, type Address, type Hash } from 'viem';
+import { createWalletClient, getAddress, http, type Address, type Hash } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import { createBasePublicClient, getBaseRpcUrl, withRpcRetry } from '../rpc';
 import { BASE_CHAIN } from '../skills/tokenlaunch/config';
 import type { StoredWorkflowWallet } from '../types';
 
@@ -46,16 +47,16 @@ function formatEth(wei: bigint): string {
 
 export async function sweepWalletsToExchange(wallets: StoredWorkflowWallet[]): Promise<SweepResult[]> {
   const depositAddress = resolveExchangeDepositAddress();
-  const rpcUrl = process.env.BASE_RPC_URL?.trim() || 'https://mainnet.base.org';
-  const transport = http(rpcUrl);
-  const publicClient = createPublicClient({ chain: BASE_CHAIN, transport });
-  const gasPrice = await publicClient.getGasPrice();
+  const publicClient = createBasePublicClient();
+  const gasPrice = await withRpcRetry('gas price', () => publicClient.getGasPrice());
   const gasCost = (TRANSFER_GAS * gasPrice * 12n) / 10n;
   const results: SweepResult[] = [];
 
   for (const wallet of wallets) {
     const account = privateKeyToAccount(normalizePrivateKey(wallet.privateKey));
-    const balance = await publicClient.getBalance({ address: account.address });
+    const balance = await withRpcRetry(`balance for wallet ${wallet.index}`, () =>
+      publicClient.getBalance({ address: account.address })
+    );
     const value = balance - gasCost;
 
     if (value <= MIN_SWEEP_WEI) {
@@ -68,7 +69,11 @@ export async function sweepWalletsToExchange(wallets: StoredWorkflowWallet[]): P
       continue;
     }
 
-    const walletClient = createWalletClient({ chain: BASE_CHAIN, transport, account });
+    const walletClient = createWalletClient({
+      chain: BASE_CHAIN,
+      transport: http(getBaseRpcUrl()),
+      account
+    });
     const hash = await walletClient.sendTransaction({
       account,
       to: depositAddress,

@@ -1,7 +1,8 @@
-import { createPublicClient, http, parseEther, type Address } from 'viem';
+import { parseEther, type Address } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { createBasePublicClient, withRpcRetry } from '../rpc';
 import { TokenLaunchInputParser, TokenLaunchService } from '../skills/tokenlaunch';
-import { BASE_CHAIN, DEFAULT_BUY_ETH, DEFAULT_LP_ETH } from '../skills/tokenlaunch/config';
+import { DEFAULT_BUY_ETH, DEFAULT_LP_ETH } from '../skills/tokenlaunch/config';
 import { WorkflowRepository, nowIso, toPublicWorkflow } from '../persist';
 import { sweepWalletsToExchange } from './sweep';
 import type {
@@ -294,8 +295,7 @@ export class LaunchWorkflowService {
     wallets: StoredWorkflowWallet[],
     input: LaunchWorkflowInput
   ): Promise<void> {
-    const rpcUrl = process.env.BASE_RPC_URL?.trim() || 'https://mainnet.base.org';
-    const publicClient = createPublicClient({ chain: BASE_CHAIN, transport: http(rpcUrl) });
+    const publicClient = createBasePublicClient();
     const deadline = Date.now() + BALANCE_TIMEOUT_MS;
 
     while (Date.now() < deadline) {
@@ -303,7 +303,9 @@ export class LaunchWorkflowService {
 
       const pending = await Promise.all(
         wallets.map(async (wallet) => {
-          const balance = await publicClient.getBalance({ address: wallet.address as Address });
+          const balance = await withRpcRetry(`balance for wallet ${wallet.index}`, () =>
+            publicClient.getBalance({ address: wallet.address as Address })
+          );
           const required = requiredBalanceWei(wallet.index, input);
           return balance >= required ? null : wallet.index;
         })
