@@ -43,7 +43,8 @@ import {
   SWAP_POLL_MS,
   aerodromeFactoryAbi,
   aerodromePoolAbi,
-  aerodromeRouterAbi
+  aerodromeRouterAbi,
+  wethAbi
 } from './config';
 import { launchTokenAbi, launchTokenBytecode } from './contracts';
 
@@ -1296,9 +1297,62 @@ export class TokenLaunchService {
         console.warn(
           receiptFailureMessage('Claim LP fees transaction failed', claimReceipt, claimHash)
         );
+        return;
       }
+
+      await this.unwrapAllWeth(publicClient, wallet1, wallet1Account, wallet1Address);
     } catch (error) {
       console.warn(`LP fee claim failed for pool ${poolAddress}:`, formatViemError(error));
+    }
+  }
+
+  /** Unwrap wallet WETH balance to native ETH (Aerodrome fee claims pay out as WETH). */
+  private async unwrapAllWeth(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    publicClient: any,
+    wallet1: WalletClient,
+    wallet1Account: NonNullable<TokenLaunchService['wallet1Account']>,
+    wallet1Address: Address
+  ): Promise<void> {
+    try {
+      const wethBalance = (await withRpcRetry('WETH balance', () =>
+        publicClient.readContract({
+          address: AERODROME.weth,
+          abi: wethAbi,
+          functionName: 'balanceOf',
+          args: [wallet1Address]
+        })
+      )) as bigint;
+      if (wethBalance <= 0n) return;
+
+      const unwrapGas = await this.estimateWriteGas(
+        publicClient,
+        {
+          account: wallet1Address,
+          address: AERODROME.weth,
+          abi: wethAbi,
+          functionName: 'withdraw',
+          args: [wethBalance]
+        },
+        50_000n
+      );
+      const unwrapHash = await wallet1.writeContract({
+        account: wallet1Account,
+        chain: BASE_CHAIN,
+        address: AERODROME.weth,
+        abi: wethAbi,
+        functionName: 'withdraw',
+        args: [wethBalance],
+        gas: unwrapGas
+      });
+      const unwrapReceipt = await publicClient.waitForTransactionReceipt({ hash: unwrapHash });
+      if (unwrapReceipt.status !== 'success') {
+        console.warn(
+          receiptFailureMessage('WETH unwrap to ETH failed', unwrapReceipt, unwrapHash)
+        );
+      }
+    } catch (error) {
+      console.warn('WETH unwrap to ETH failed:', formatViemError(error));
     }
   }
 }

@@ -8,6 +8,24 @@ export const AERODROME = {
   weth: '0x4200000000000000000000000000000000000006' as const
 };
 
+/** Base WETH9 — unwrap claimed LP fees to native ETH */
+export const wethAbi = [
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ type: 'uint256' }]
+  },
+  {
+    type: 'function',
+    name: 'withdraw',
+    stateMutability: 'nonpayable',
+    inputs: [{ name: 'wad', type: 'uint256' }],
+    outputs: []
+  }
+] as const;
+
 export const DEFAULT_TOKEN_SUPPLY = 1_000_000_000n * 10n ** 18n;
 export const DEFAULT_LP_ETH = '0.01';
 export const DEFAULT_BUY_ETH = '0.001';
