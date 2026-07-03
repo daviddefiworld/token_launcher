@@ -4,11 +4,17 @@
   "version": "0.1.0",
   "description": "No-auth token automation demo with backend, dashboard, and browser extension.",
   "scripts": {
+    "install:all": "npm install && npm --prefix backend install && npm --prefix dashboard install && npm --prefix extension install",
+    "dev": "concurrently --names \"backend,dashboard,extension\" --prefix-colors \"cyan,magenta,yellow\" --kill-others \"npm:backend:dev\" \"npm:dashboard:dev\" \"npm:extension:dev\"",
+    "build": "npm run backend:build && npm run dashboard:build && npm run extension:build",
     "backend:dev": "npm --prefix backend run dev",
     "backend:build": "npm --prefix backend run build",
     "dashboard:dev": "npm --prefix dashboard run dev",
     "dashboard:build": "npm --prefix dashboard run build",
     "extension:dev": "npm --prefix extension run dev",
     "extension:build": "npm --prefix extension run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
   }
 }

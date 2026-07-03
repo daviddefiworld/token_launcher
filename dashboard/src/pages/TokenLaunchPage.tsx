@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import {
@@ -10,10 +10,22 @@ import {
   startTokenLaunch,
   type TokenLaunchInput
 } from '../api';
-import type { LpRemovalResult, TokenLaunchJob, TokenLaunchStatus, UnremovedLpPosition } from '../types';
+import type { DexKey, LpRemovalResult, TokenLaunchJob, TokenLaunchStatus, UnremovedLpPosition } from '../types';
 import { formatRelativeTime, shortId } from '../utils';
 
+const DEX_LABELS: Record<DexKey, string> = {
+  aerodrome: 'Aerodrome',
+  uniswap: 'Uniswap V2'
+};
+
+const DEX_ORDER: DexKey[] = ['uniswap', 'aerodrome'];
+
+function dexLabel(dex?: DexKey): string {
+  return dex ? DEX_LABELS[dex] : DEX_LABELS.aerodrome;
+}
+
 const DEFAULT_INPUT: TokenLaunchInput = {
+  dex: 'uniswap',
   tokenName: 'AI',
   tokenSymbol: 'AI',
   lpEthAmount: '0.01',
@@ -27,11 +39,11 @@ const DEFAULT_INPUT: TokenLaunchInput = {
   minBuyersBeforeRemoveLp: 1
 };
 
-function launchStatusClass(status: TokenLaunchStatus): string {
-  if (status === 'completed') return 'pill success';
-  if (status === 'failed') return 'pill danger';
-  return 'pill muted';
-}
+// Rough gas headroom per wallet (mirrors the workflow's withdraw buffers).
+const W1_GAS_BUFFER = 0.004;
+const BUY_GAS_BUFFER = 0.001;
+
+const HISTORY_PAGE_SIZE = 5;
 
 function baseScanTx(hash: string): string {
   return `https://basescan.org/tx/${hash}`;
@@ -39,6 +51,15 @@ function baseScanTx(hash: string): string {
 
 function baseScanAddress(address: string): string {
   return `https://basescan.org/address/${address}`;
+}
+
+function shortAddr(address: string): string {
+  return address.length > 12 ? `${address.slice(0, 6)}…${address.slice(-4)}` : address;
+}
+
+function toNum(value: string | number | undefined): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
 const MANUAL_BUY_STATUSES: TokenLaunchStatus[] = ['monitoring', 'buying'];
@@ -52,16 +73,83 @@ const ACTIVE_LAUNCH_STATUSES: TokenLaunchStatus[] = [
   'removing_liquidity'
 ];
 
+function isActiveStatus(status: TokenLaunchStatus): boolean {
+  return ACTIVE_LAUNCH_STATUSES.includes(status);
+}
+
+function launchBadge(status: TokenLaunchStatus): { label: string; cls: string } {
+  if (status === 'completed') return { label: 'completed', cls: 'pill success' };
+  if (status === 'failed') return { label: 'failed', cls: 'pill danger' };
+  return { label: status.replace(/_/g, ' '), cls: 'pill live' };
+}
+
 function canManualBuy(job: TokenLaunchJob): boolean {
   return MANUAL_BUY_STATUSES.includes(job.status) && Boolean(job.tokenAddress) && Boolean(job.poolAddress);
 }
 
 function canFinish(job: TokenLaunchJob): boolean {
-  return ACTIVE_LAUNCH_STATUSES.includes(job.status);
+  return isActiveStatus(job.status);
 }
 
 function jobUsesWallet3(job: TokenLaunchJob): boolean {
   return job.input.useWallet3 === true;
+}
+
+type WalletView = {
+  index: 1 | 2 | 3;
+  role: string;
+  address?: string;
+  balance?: string;
+  need: number;
+  configured: boolean;
+  optional?: boolean;
+};
+
+function WalletRow({ wallet }: { wallet: WalletView }) {
+  const balance = wallet.balance != null ? Number(wallet.balance) : NaN;
+  const status: 'ok' | 'warn' | 'off' = !wallet.configured
+    ? 'off'
+    : Number.isFinite(balance) && wallet.need > 0 && balance + 1e-9 < wallet.need
+      ? 'warn'
+      : 'ok';
+
+  return (
+    <div className="tl-wrow">
+      <span className={`tl-dot ${status}`} aria-hidden />
+      <div className="tl-wrow-body">
+        <div className="tl-wrow-top">
+          <span className="tl-wrow-role">
+            W{wallet.index} · {wallet.role}
+          </span>
+          {wallet.configured && wallet.address && (
+            <a
+              className="tl-wrow-addr"
+              href={baseScanAddress(wallet.address)}
+              target="_blank"
+              rel="noreferrer"
+            >
+              {shortAddr(wallet.address)}
+            </a>
+          )}
+        </div>
+        {wallet.configured ? (
+          <p className="tl-wrow-bal">
+            <span className="tl-wrow-amount">{wallet.balance ?? '—'}</span>
+            <span className="tl-unit-sm">ETH</span>
+            {wallet.need > 0 && (
+              <span className={`tl-wrow-need${status === 'warn' ? ' warn' : ''}`}>
+                {status === 'warn' ? 'low · ' : ''}need {wallet.need.toFixed(4)}
+              </span>
+            )}
+          </p>
+        ) : (
+          <p className="tl-wrow-off">
+            {wallet.optional ? 'Optional · set WALLET_3_PRIVATE_KEY' : 'Not configured'}
+          </p>
+        )}
+      </div>
+    </div>
+  );
 }
 
 export function TokenLaunchPage({
@@ -95,10 +183,20 @@ export function TokenLaunchPage({
   const [manualBuyError, setManualBuyError] = useState<string | null>(null);
   const [finishBusy, setFinishBusy] = useState<string | null>(null);
   const [finishError, setFinishError] = useState<string | null>(null);
+  const [historyPage, setHistoryPage] = useState(1);
 
-  const hasActiveJob = jobs.some((job) =>
-    ['pending', 'deploying', 'adding_liquidity', 'monitoring', 'buying', 'removing_liquidity'].includes(job.status)
+  const hasActiveJob = jobs.some((job) => isActiveStatus(job.status));
+
+  const historyPageCount = Math.max(1, Math.ceil(jobs.length / HISTORY_PAGE_SIZE));
+  const currentHistoryPage = Math.min(historyPage, historyPageCount);
+  const pagedJobs = useMemo(
+    () => jobs.slice((currentHistoryPage - 1) * HISTORY_PAGE_SIZE, currentHistoryPage * HISTORY_PAGE_SIZE),
+    [jobs, currentHistoryPage]
   );
+
+  useEffect(() => {
+    if (historyPage > historyPageCount) setHistoryPage(historyPageCount);
+  }, [historyPage, historyPageCount]);
 
   const reloadStatus = useCallback(async () => {
     setLoading(true);
@@ -138,19 +236,29 @@ export function TokenLaunchPage({
     setInput((current) => ({ ...current, [field]: value }));
   };
 
-  const reloadUnremovedLp = useCallback(async () => {
-    if (!configured) return;
-    setLpLoading(true);
-    setLpError(null);
-    try {
-      setUnremovedLp(await getUnremovedLp());
-    } catch (err) {
-      setUnremovedLp([]);
-      setLpError(err instanceof Error ? err.message : 'Failed to scan wallet LP');
-    } finally {
-      setLpLoading(false);
-    }
-  }, [configured]);
+  const reloadUnremovedLp = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!configured) return;
+      // Silent mode (used after a removal) refreshes the list in place without the "Scanning…"
+      // spinner that blanks the panel, and without clobbering the removal result notice on error.
+      const silent = options?.silent ?? false;
+      if (!silent) {
+        setLpLoading(true);
+        setLpError(null);
+      }
+      try {
+        setUnremovedLp(await getUnremovedLp());
+      } catch (err) {
+        if (!silent) {
+          setUnremovedLp([]);
+          setLpError(err instanceof Error ? err.message : 'Failed to scan wallet LP');
+        }
+      } finally {
+        if (!silent) setLpLoading(false);
+      }
+    },
+    [configured]
+  );
 
   useEffect(() => {
     if (configured) void reloadUnremovedLp();
@@ -163,15 +271,32 @@ export function TokenLaunchPage({
     return `Removed ${ok} pool${ok === 1 ? '' : 's'}, ${failed} failed.`;
   };
 
+  // Drop pools that were removed successfully so they disappear from the list right away,
+  // instead of waiting on (and blanking the panel for) a full on-chain rescan.
+  const dropRemovedPools = (results: LpRemovalResult[]) => {
+    const removed = new Set(results.filter((r) => r.success).map((r) => r.poolAddress.toLowerCase()));
+    if (removed.size === 0) return;
+    setUnremovedLp((current) => current.filter((p) => !removed.has(p.poolAddress.toLowerCase())));
+  };
+
+  // Show the reason for any pool that failed to remove, not just a "N failed" count.
+  const showRemovalErrors = (results: LpRemovalResult[]) => {
+    const failed = results.filter((r) => !r.success);
+    if (failed.length === 0) return;
+    setLpError(failed.map((r) => r.error?.trim() || 'Unknown error').join(' · '));
+  };
+
   const removeOneLp = async (poolAddress: string) => {
     setLpBusyPool(poolAddress);
     setLpError(null);
     setLpNotice(null);
     try {
       const results = await removeUnremovedLp({ poolAddress });
-      await reloadUnremovedLp();
-      await reloadJobs();
       setLpNotice(summarizeRemoval(results));
+      showRemovalErrors(results);
+      dropRemovedPools(results);
+      void reloadUnremovedLp({ silent: true });
+      void reloadJobs();
     } catch (err) {
       setLpError(err instanceof Error ? err.message : 'Failed to remove LP');
     } finally {
@@ -185,9 +310,11 @@ export function TokenLaunchPage({
     setLpNotice(null);
     try {
       const results = await removeUnremovedLp({ all: true });
-      await reloadUnremovedLp();
-      await reloadJobs();
       setLpNotice(results.length === 0 ? 'No stranded LP found on wallet 1.' : summarizeRemoval(results));
+      showRemovalErrors(results);
+      dropRemovedPools(results);
+      void reloadUnremovedLp({ silent: true });
+      void reloadJobs();
     } catch (err) {
       setLpError(err instanceof Error ? err.message : 'Failed to remove all LP');
     } finally {
@@ -243,180 +370,279 @@ export function TokenLaunchPage({
     }
   };
 
+  const wallet2Need = toNum(input.wallet2BuyEthAmount ?? input.buyEthAmount) + BUY_GAS_BUFFER;
+  const wallet3Need = input.useWallet3 ? toNum(input.buyEthAmount) + BUY_GAS_BUFFER : 0;
+  const wallet1Need = toNum(input.lpEthAmount) + W1_GAS_BUFFER;
+
+  const wallets: WalletView[] = [
+    {
+      index: 1,
+      role: 'Deploy + LP',
+      address: wallet1Address,
+      balance: wallet1BalanceEth,
+      need: wallet1Need,
+      configured
+    },
+    {
+      index: 2,
+      role: 'Buyer',
+      address: wallet2Address,
+      balance: wallet2BalanceEth,
+      need: wallet2Need,
+      configured
+    },
+    {
+      index: 3,
+      role: 'Buyer · optional',
+      address: wallet3Address,
+      balance: wallet3BalanceEth,
+      need: wallet3Need,
+      configured: wallet3Configured,
+      optional: true
+    }
+  ];
+
+  const submitLabel = busy
+    ? 'Starting…'
+    : hasActiveJob
+      ? input.repeatCount > 1
+        ? 'Batch in progress…'
+        : 'Launch in progress…'
+      : input.repeatCount > 1
+        ? `Start ${input.repeatCount} launches`
+        : `Start launch on ${dexLabel(input.dex)}`;
+
   return (
-    <main className="page narrow">
-      <div className="page-heading">
-        <div>
-          <p className="eyebrow">Base · Aerodrome</p>
-          <h1>Token Launch</h1>
-          <p className="subtle">
-            Deploy a token, add LP with wallet 1, monitor buyers, optionally buy with wallets 2 and/or 3 after your delay,
-            then remove LP after your chosen timeout (optional — disable auto-remove to clean up later from stranded LP).
-          </p>
-        </div>
-        <button type="button" onClick={() => void reloadStatus()} className="button secondary" disabled={loading}>
-          Refresh
-        </button>
-      </div>
+    <main className="page tl-page tl-layout">
+      <div className="tl-main">
+        <header className="tl-head">
+          <div>
+            <p className="eyebrow">Base · {dexLabel(input.dex)}</p>
+            <h1>Token Launch</h1>
+          </div>
+        </header>
 
-      <section className="detail-panel">
-        <h2 className="section-title">Wallet setup</h2>
-        {loading ? (
-          <p className="subtle">Loading configuration...</p>
-        ) : configured ? (
-          <>
-            <p className="subtle">RPC: {rpcUrl}</p>
-            <p className="mono subtle">
-              Wallet 1 (deploy + LP): {wallet1Address}
-              {wallet1BalanceEth ? ` · ${wallet1BalanceEth} ETH` : ''}
+        {!loading && !configured && (
+          <section className="detail-panel tl-config-warning">
+            <strong>Wallets not configured.</strong>
+            <p className="subtle" style={{ margin: '6px 0 0' }}>
+              Set <span className="mono">WALLET_1_PRIVATE_KEY</span> and <span className="mono">WALLET_2_PRIVATE_KEY</span>{' '}
+              in <span className="mono">backend/.env</span>, then restart the backend.
             </p>
-            <p className="mono subtle">
-              Wallet 2 (buy): {wallet2Address}
-              {wallet2BalanceEth ? ` · ${wallet2BalanceEth} ETH` : ''}
-            </p>
-            <p className="mono subtle">
-              Wallet 3 (optional buy):{' '}
-              {wallet3Configured ? wallet3Address : 'not configured — set WALLET_3_PRIVATE_KEY to enable'}
-              {wallet3Configured && wallet3BalanceEth ? ` · ${wallet3BalanceEth} ETH` : ''}
-            </p>
-          </>
-        ) : (
-          <p className="error">
-            Set WALLET_1_PRIVATE_KEY and WALLET_2_PRIVATE_KEY in backend/.env, then restart the backend.
-          </p>
+          </section>
         )}
-      </section>
 
-      <section className="detail-panel">
-        <h2 className="section-title">Launch control</h2>
-        <form className="withdraw-form" onSubmit={launch}>
-          <label>
-            Token name
-            <input value={input.tokenName} onChange={(e) => updateInput('tokenName', e.target.value)} required />
-          </label>
-          <label>
-            Token symbol
-            <input value={input.tokenSymbol} onChange={(e) => updateInput('tokenSymbol', e.target.value)} required />
-          </label>
-          <label>
-            LP ETH amount
-            <input value={input.lpEthAmount} onChange={(e) => updateInput('lpEthAmount', e.target.value)} required />
-          </label>
-          <label>
-            Wallet 2 buy amount (ETH)
-            <input
-              value={input.wallet2BuyEthAmount}
-              onChange={(e) => updateInput('wallet2BuyEthAmount', e.target.value)}
-              required
-            />
-          </label>
-          <label className="checkbox-row">
-            <input
-              type="checkbox"
-              checked={input.useWallet3}
-              disabled={!wallet3Configured}
-              onChange={(e) => updateInput('useWallet3', e.target.checked)}
-            />
-            Use wallet 3 for buys
-            {!wallet3Configured && <span className="subtle"> (set WALLET_3_PRIVATE_KEY first)</span>}
-          </label>
-          {input.useWallet3 && (
-            <label>
-              Wallet 3 buy amount (ETH)
+      <section className="detail-panel tl-form-card">
+        <div className="tl-section-head">
+          <h2 className="section-title" style={{ marginBottom: 0 }}>
+            New launch
+          </h2>
+          <div className="tl-dex-toggle" role="group" aria-label="DEX">
+            {DEX_ORDER.map((dex) => (
+              <button
+                key={dex}
+                type="button"
+                className={`tl-dex-option${input.dex === dex ? ' active' : ''}`}
+                onClick={() => updateInput('dex', dex)}
+                disabled={busy || hasActiveJob}
+              >
+                {DEX_LABELS[dex]}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <form className="tl-form" onSubmit={launch}>
+          <fieldset className="tl-fieldset">
+            <legend className="tl-legend">Token</legend>
+            <div className="tl-grid">
+              <div className="tl-field">
+                <label htmlFor="tl-name">Name</label>
+                <div className="tl-input-wrap">
+                  <input
+                    id="tl-name"
+                    className="tl-input"
+                    value={input.tokenName}
+                    onChange={(e) => updateInput('tokenName', e.target.value)}
+                    required
+                  />
+                </div>
+              </div>
+              <div className="tl-field">
+                <label htmlFor="tl-symbol">Symbol</label>
+                <div className="tl-input-wrap">
+                  <input
+                    id="tl-symbol"
+                    className="tl-input"
+                    value={input.tokenSymbol}
+                    onChange={(e) => updateInput('tokenSymbol', e.target.value)}
+                    required
+                  />
+                </div>
+              </div>
+            </div>
+          </fieldset>
+
+          <fieldset className="tl-fieldset">
+            <legend className="tl-legend">Liquidity &amp; buys</legend>
+            <div className="tl-grid">
+              <div className="tl-field">
+                <label htmlFor="tl-lp">LP liquidity</label>
+                <div className="tl-input-wrap">
+                  <input
+                    id="tl-lp"
+                    className="tl-input"
+                    inputMode="decimal"
+                    value={input.lpEthAmount}
+                    onChange={(e) => updateInput('lpEthAmount', e.target.value)}
+                    required
+                  />
+                  <span className="tl-unit">ETH</span>
+                </div>
+              </div>
+              <div className="tl-field">
+                <label htmlFor="tl-w2buy">Wallet 2 buy</label>
+                <div className="tl-input-wrap">
+                  <input
+                    id="tl-w2buy"
+                    className="tl-input"
+                    inputMode="decimal"
+                    value={input.wallet2BuyEthAmount}
+                    onChange={(e) => updateInput('wallet2BuyEthAmount', e.target.value)}
+                    required
+                  />
+                  <span className="tl-unit">ETH</span>
+                </div>
+              </div>
+              {input.useWallet3 && (
+                <div className="tl-field">
+                  <label htmlFor="tl-w3buy">Wallet 3 buy</label>
+                  <div className="tl-input-wrap">
+                    <input
+                      id="tl-w3buy"
+                      className="tl-input"
+                      inputMode="decimal"
+                      value={input.buyEthAmount}
+                      onChange={(e) => updateInput('buyEthAmount', e.target.value)}
+                      required
+                    />
+                    <span className="tl-unit">ETH</span>
+                  </div>
+                </div>
+              )}
+              <div className="tl-field">
+                <label htmlFor="tl-after">Own buy after</label>
+                <div className="tl-input-wrap">
+                  <input
+                    id="tl-after"
+                    className="tl-input"
+                    type="number"
+                    min={1}
+                    max={3600}
+                    step={1}
+                    value={input.buyAfterSeconds}
+                    onChange={(e) =>
+                      updateInput('buyAfterSeconds', Math.max(1, Number.parseInt(e.target.value, 10) || 30))
+                    }
+                    required
+                  />
+                  <span className="tl-unit">sec</span>
+                </div>
+              </div>
+            </div>
+            <label className={`tl-toggle tl-span-2${!wallet3Configured ? ' disabled' : ''}`}>
               <input
-                value={input.buyEthAmount}
-                onChange={(e) => updateInput('buyEthAmount', e.target.value)}
-                required
+                type="checkbox"
+                checked={input.useWallet3}
+                disabled={!wallet3Configured}
+                onChange={(e) => updateInput('useWallet3', e.target.checked)}
               />
+              <span>
+                Use wallet 3 for buys
+                {!wallet3Configured && <span className="subtle"> · set WALLET_3_PRIVATE_KEY first</span>}
+              </span>
             </label>
-          )}
-          <label>
-            Own buy after (seconds)
-            <input
-              type="number"
-              min={1}
-              max={3600}
-              step={1}
-              value={input.buyAfterSeconds}
-              onChange={(e) =>
-                updateInput('buyAfterSeconds', Math.max(1, Number.parseInt(e.target.value, 10) || 30))
-              }
-              required
-            />
-          </label>
-          <p className="subtle">
-            If no external buyers within this time, wallet 2{input.useWallet3 ? ' and wallet 3' : ''} buy automatically.
-          </p>
-          <label>
-            Repeat count
-            <input
-              type="number"
-              min={1}
-              max={50}
-              step={1}
-              value={input.repeatCount}
-              onChange={(e) => updateInput('repeatCount', Math.max(1, Number.parseInt(e.target.value, 10) || 1))}
-              required
-            />
-          </label>
-          <label>
-            Remove LP after (minutes)
-            <input
-              type="number"
-              min={1}
-              max={180}
-              step={1}
-              value={input.removeLpTimeMinutes}
-              onChange={(e) =>
-                updateInput('removeLpTimeMinutes', Math.max(1, Number.parseInt(e.target.value, 10) || 1))
-              }
-              required
-            />
-          </label>
-          <label>
-            Min buyers before remove LP
-            <input
-              type="number"
-              min={1}
-              max={100}
-              step={1}
-              value={input.minBuyersBeforeRemoveLp}
-              onChange={(e) =>
-                updateInput(
-                  'minBuyersBeforeRemoveLp',
-                  Math.max(1, Number.parseInt(e.target.value, 10) || 1)
-                )
-              }
-              required
-            />
-          </label>
-          <label className="checkbox-row">
-            <input
-              type="checkbox"
-              checked={input.removeLp}
-              onChange={(e) => updateInput('removeLp', e.target.checked)}
-            />
-            Remove LP automatically (when min buyers met or after timeout above)
-          </label>
+          </fieldset>
+
+          <fieldset className="tl-fieldset">
+            <legend className="tl-legend">Exit &amp; repeat</legend>
+            <div className="tl-grid">
+              <div className="tl-field">
+                <label htmlFor="tl-minbuyers">Min buyers to exit</label>
+                <div className="tl-input-wrap">
+                  <input
+                    id="tl-minbuyers"
+                    className="tl-input"
+                    type="number"
+                    min={1}
+                    max={100}
+                    step={1}
+                    value={input.minBuyersBeforeRemoveLp}
+                    onChange={(e) =>
+                      updateInput('minBuyersBeforeRemoveLp', Math.max(1, Number.parseInt(e.target.value, 10) || 1))
+                    }
+                    required
+                  />
+                </div>
+              </div>
+              <div className="tl-field">
+                <label htmlFor="tl-removetime">Remove LP after</label>
+                <div className="tl-input-wrap">
+                  <input
+                    id="tl-removetime"
+                    className="tl-input"
+                    type="number"
+                    min={1}
+                    max={180}
+                    step={1}
+                    value={input.removeLpTimeMinutes}
+                    onChange={(e) =>
+                      updateInput('removeLpTimeMinutes', Math.max(1, Number.parseInt(e.target.value, 10) || 1))
+                    }
+                    required
+                  />
+                  <span className="tl-unit">min</span>
+                </div>
+              </div>
+              <div className="tl-field">
+                <label htmlFor="tl-repeat">Repeat count</label>
+                <div className="tl-input-wrap">
+                  <input
+                    id="tl-repeat"
+                    className="tl-input"
+                    type="number"
+                    min={1}
+                    max={50}
+                    step={1}
+                    value={input.repeatCount}
+                    onChange={(e) => updateInput('repeatCount', Math.max(1, Number.parseInt(e.target.value, 10) || 1))}
+                    required
+                  />
+                </div>
+              </div>
+            </div>
+            <label className="tl-toggle tl-span-2">
+              <input
+                type="checkbox"
+                checked={input.removeLp}
+                onChange={(e) => updateInput('removeLp', e.target.checked)}
+              />
+              <span>Remove LP automatically when min buyers met or after the timeout</span>
+            </label>
+          </fieldset>
+
           <button
             type="submit"
-            className="button"
+            className="button tl-cta"
             disabled={!configured || busy || hasActiveJob || (input.useWallet3 && !wallet3Configured)}
           >
-            {busy
-              ? 'Starting...'
-              : hasActiveJob
-                ? input.repeatCount > 1
-                  ? 'Batch in progress...'
-                  : 'Launch in progress...'
-                : input.repeatCount > 1
-                  ? `Start ${input.repeatCount} launches`
-                  : 'Start token launch'}
+            {submitLabel}
           </button>
         </form>
+
         {hasActiveJob && !busy && (
-          <p className="subtle">
-            A launch batch is running. Wait for all repeats to finish before starting another.
+          <p className="subtle" style={{ marginTop: 12 }}>
+            A launch batch is running — wait for it to finish before starting another.
           </p>
         )}
         {notice && <p className="result">{notice}</p>}
@@ -425,68 +651,67 @@ export function TokenLaunchPage({
 
       <section className="detail-panel">
         <div className="card-title-row">
-          <h2 className="section-title">Stranded LP (wallet 1)</h2>
+          <h2 className="section-title">Stranded LP</h2>
           <button
             type="button"
             className="button secondary"
             onClick={() => void reloadUnremovedLp()}
             disabled={!configured || lpLoading || lpRemovingAll || Boolean(lpBusyPool)}
           >
-            {lpLoading ? 'Scanning...' : 'Refresh'}
+            {lpLoading ? 'Scanning…' : 'Refresh'}
           </button>
         </div>
         <p className="subtle">
-          Aerodrome LP still held by wallet 1. Available anytime, including during an active launch.
+          Aerodrome &amp; Uniswap LP still held by wallet&nbsp;1. Available anytime, including during an active launch.
         </p>
         {lpLoading ? (
-          <p className="subtle">Scanning on-chain LP balances...</p>
+          <p className="subtle">Scanning on-chain LP balances…</p>
         ) : unremovedLp.length === 0 ? (
           <p className="subtle">No stranded LP detected.</p>
         ) : (
           <>
             <div className="order-list">
               {unremovedLp.map((position) => (
-                <article key={position.poolAddress} className="order-card">
-                  <div className="card-title-row">
-                    <strong>
-                      {position.tokenName || 'Token'} ({position.tokenSymbol || '???'})
-                    </strong>
+                <article key={position.poolAddress} className="tl-launch-card">
+                  <div className="tl-launch-head">
+                    <div>
+                      <span className="tl-launch-title">
+                        {position.tokenName || 'Token'} <span className="tl-launch-sym">({position.tokenSymbol || '???'})</span>
+                      </span>
+                      <p className="tl-meta-row">LP balance {position.lpBalance}</p>
+                    </div>
                     <button
                       type="button"
                       className="button secondary"
                       disabled={lpRemovingAll || lpBusyPool === position.poolAddress}
                       onClick={() => void removeOneLp(position.poolAddress)}
                     >
-                      {lpBusyPool === position.poolAddress ? 'Removing...' : 'Remove LP'}
+                      {lpBusyPool === position.poolAddress ? 'Removing…' : 'Remove LP'}
                     </button>
                   </div>
-                  <p className="subtle mono">
-                    Pool:{' '}
-                    <a href={baseScanAddress(position.poolAddress)} target="_blank" rel="noreferrer">
-                      {shortId(position.poolAddress)}
+                  <div className="tl-chips">
+                    <span className="tl-chip accent">{dexLabel(position.dex)}</span>
+                    <a className="tl-chip" href={baseScanAddress(position.poolAddress)} target="_blank" rel="noreferrer">
+                      pool {shortId(position.poolAddress)}
                     </a>
-                  </p>
-                  <p className="subtle mono">
-                    Token:{' '}
-                    <a href={baseScanAddress(position.tokenAddress)} target="_blank" rel="noreferrer">
-                      {shortId(position.tokenAddress)}
+                    <a className="tl-chip" href={baseScanAddress(position.tokenAddress)} target="_blank" rel="noreferrer">
+                      token {shortId(position.tokenAddress)}
                     </a>
-                  </p>
-                  <p className="subtle mono">LP balance: {position.lpBalance}</p>
-                  {position.jobIds.length > 0 && (
-                    <p className="subtle mono">Jobs: {position.jobIds.map(shortId).join(', ')}</p>
-                  )}
+                    {position.jobIds.length > 0 && (
+                      <span className="tl-chip">{position.jobIds.length} job{position.jobIds.length === 1 ? '' : 's'}</span>
+                    )}
+                  </div>
                 </article>
               ))}
             </div>
             <button
               type="button"
               className="button"
-              style={{ marginTop: 12 }}
+              style={{ marginTop: 14 }}
               disabled={!configured || lpRemovingAll || Boolean(lpBusyPool)}
               onClick={() => void removeAllLp()}
             >
-              {lpRemovingAll ? 'Removing all...' : `Remove all (${unremovedLp.length})`}
+              {lpRemovingAll ? 'Removing all…' : `Remove all (${unremovedLp.length})`}
             </button>
           </>
         )}
@@ -501,144 +726,200 @@ export function TokenLaunchPage({
       )}
 
       <section>
-        <h2 className="section-title">Recent launches</h2>
+        <div className="card-title-row" style={{ marginBottom: 14 }}>
+          <h2 className="section-title" style={{ marginBottom: 0 }}>
+            Recent launches
+          </h2>
+          <Link to="/orders" className="back-link" style={{ marginBottom: 0 }}>
+            All activity →
+          </Link>
+        </div>
         {jobs.length === 0 ? (
-          <div className="empty small">No token launches yet.</div>
+          <div className="empty small">No token launches yet — fill the form above to start one.</div>
         ) : (
           <div className="order-list">
-            {jobs.map((job) => (
-              <article key={job.jobId} className="order-card">
-                <div className="card-title-row">
-                  <strong>
-                    {job.input.tokenName} ({job.input.tokenSymbol})
-                    {job.repeatTotal && job.repeatTotal > 1 && job.repeatIndex
-                      ? ` · ${job.repeatIndex}/${job.repeatTotal}`
-                      : ''}
-                  </strong>
-                  <span className={launchStatusClass(job.status)}>{job.status}</span>
-                </div>
-                <p className="subtle order-summary">
-                  {job.input.lpEthAmount} ETH LP · own buy after {job.input.buyAfterSeconds ?? 30}s ·{' '}
-                  {job.input.removeLpTimeMinutes ?? 5} min · min {job.input.minBuyersBeforeRemoveLp ?? 1} buyers · seen{' '}
-                  {job.buyerCount}
-                  {jobUsesWallet3(job) ? ' · W3 on' : ''}
-                  {job.input.removeLp === false ? ' · LP kept' : ''}
-                  {job.phase ? ` · ${job.phase}` : ''}
-                </p>
-                <p className="subtle mono">Job {shortId(job.jobId)} · {formatRelativeTime(job.updatedAt)}</p>
-                {(canManualBuy(job) || canFinish(job)) && (
-                  <div className="launch-buy-actions">
-                    {canManualBuy(job) && (
-                      <>
-                        <button
-                          type="button"
-                          className="button secondary"
-                          disabled={Boolean(manualBuyBusy) || Boolean(finishBusy)}
-                          onClick={() => void manualBuy(job, 2)}
-                        >
-                          {manualBuyBusy === `${job.jobId}:2`
-                            ? 'Buying...'
-                            : `Buy W2 (${wallet2BuyAmount(job)} ETH)`}
-                        </button>
-                        {jobUsesWallet3(job) && (
+            {pagedJobs.map((job) => {
+              const badge = launchBadge(job.status);
+              const txChips: { label: string; hash: string }[] = [
+                ...(job.deployTxHash ? [{ label: 'deploy', hash: job.deployTxHash }] : []),
+                ...(job.addLiquidityTxHash ? [{ label: 'add LP', hash: job.addLiquidityTxHash }] : []),
+                ...(job.buyTxHash ? [{ label: 'W2 buy', hash: job.buyTxHash }] : []),
+                ...(job.wallet3BuyTxHash ? [{ label: 'W3 buy', hash: job.wallet3BuyTxHash }] : []),
+                ...(job.removeLiquidityTxHash ? [{ label: 'remove LP', hash: job.removeLiquidityTxHash }] : [])
+              ];
+              return (
+                <article key={job.jobId} className="tl-launch-card">
+                  <div className="tl-launch-head">
+                    <div>
+                      <span className="tl-launch-title">
+                        {job.input.tokenName} <span className="tl-launch-sym">({job.input.tokenSymbol})</span>
+                        {job.repeatTotal && job.repeatTotal > 1 && job.repeatIndex
+                          ? ` · ${job.repeatIndex}/${job.repeatTotal}`
+                          : ''}
+                      </span>
+                      <p className="tl-meta-row">
+                        Job {shortId(job.jobId)} · {formatRelativeTime(job.updatedAt)}
+                      </p>
+                    </div>
+                    <span className={badge.cls}>{badge.label}</span>
+                  </div>
+
+                  <div className="tl-chips">
+                    <span className="tl-chip accent">{dexLabel(job.input.dex)}</span>
+                    <span className="tl-chip">{job.input.lpEthAmount} Ξ LP</span>
+                    <span className="tl-chip">seen {job.buyerCount}</span>
+                    <span className="tl-chip">min {job.input.minBuyersBeforeRemoveLp ?? 1}</span>
+                    {job.input.removeLp === false ? (
+                      <span className="tl-chip">LP kept</span>
+                    ) : (
+                      <span className="tl-chip">{job.input.removeLpTimeMinutes ?? 5}m exit</span>
+                    )}
+                    {jobUsesWallet3(job) && <span className="tl-chip">W3 on</span>}
+                  </div>
+
+                  {job.phase && <p className="tl-phase">{job.phase}</p>}
+
+                  {(canManualBuy(job) || canFinish(job)) && (
+                    <div className="launch-buy-actions">
+                      {canManualBuy(job) && (
+                        <>
                           <button
                             type="button"
                             className="button secondary"
                             disabled={Boolean(manualBuyBusy) || Boolean(finishBusy)}
-                            onClick={() => void manualBuy(job, 3)}
+                            onClick={() => void manualBuy(job, 2)}
                           >
-                            {manualBuyBusy === `${job.jobId}:3`
-                              ? 'Buying...'
-                              : `Buy W3 (${job.input.buyEthAmount} ETH)`}
+                            {manualBuyBusy === `${job.jobId}:2`
+                              ? 'Buying…'
+                              : `Buy W2 (${wallet2BuyAmount(job)} ETH)`}
                           </button>
-                        )}
-                      </>
-                    )}
-                    {canFinish(job) && (
-                      <button
-                        type="button"
-                        className="button secondary"
-                        disabled={Boolean(manualBuyBusy) || finishBusy === job.jobId}
-                        onClick={() => void finishLaunch(job)}
-                      >
-                        {finishBusy === job.jobId ? 'Finishing...' : 'Finish'}
-                      </button>
-                    )}
-                  </div>
-                )}
-                {job.tokenAddress && job.poolAddress && (
-                  <p style={{ marginTop: 10 }}>
-                    <Link to={`/tokenlaunch/${job.jobId}`} className="back-link" style={{ marginBottom: 0 }}>
-                      View analyzer
-                      {job.trades && job.trades.length > 0 ? ` (${job.trades.length} trades)` : ''}
-                    </Link>
-                  </p>
-                )}
-                {job.tokenAddress && (
-                  <p className="subtle mono">
-                    Token:{' '}
-                    <a href={baseScanAddress(job.tokenAddress)} target="_blank" rel="noreferrer">
-                      {shortId(job.tokenAddress)}
-                    </a>
-                  </p>
-                )}
-                {job.poolAddress && (
-                  <p className="subtle mono">
-                    Pool:{' '}
-                    <a href={baseScanAddress(job.poolAddress)} target="_blank" rel="noreferrer">
-                      {shortId(job.poolAddress)}
-                    </a>
-                  </p>
-                )}
-                {job.deployTxHash && (
-                  <p className="subtle mono">
-                    Deploy:{' '}
-                    <a href={baseScanTx(job.deployTxHash)} target="_blank" rel="noreferrer">
-                      {shortId(job.deployTxHash)}
-                    </a>
-                  </p>
-                )}
-                {job.addLiquidityTxHash && (
-                  <p className="subtle mono">
-                    Add LP:{' '}
-                    <a href={baseScanTx(job.addLiquidityTxHash)} target="_blank" rel="noreferrer">
-                      {shortId(job.addLiquidityTxHash)}
-                    </a>
-                  </p>
-                )}
-                {job.buyTxHash && (
-                  <p className="subtle mono">
-                    Wallet 2 buy:{' '}
-                    <a href={baseScanTx(job.buyTxHash)} target="_blank" rel="noreferrer">
-                      {shortId(job.buyTxHash)}
-                    </a>
-                  </p>
-                )}
-                {job.wallet3BuyTxHash && (
-                  <p className="subtle mono">
-                    Wallet 3 buy:{' '}
-                    <a href={baseScanTx(job.wallet3BuyTxHash)} target="_blank" rel="noreferrer">
-                      {shortId(job.wallet3BuyTxHash)}
-                    </a>
-                  </p>
-                )}
-                {job.removeLiquidityTxHash && (
-                  <p className="subtle mono">
-                    Remove LP:{' '}
-                    <a href={baseScanTx(job.removeLiquidityTxHash)} target="_blank" rel="noreferrer">
-                      {shortId(job.removeLiquidityTxHash)}
-                    </a>
-                  </p>
-                )}
-                {job.error && <p className="error">{job.error}</p>}
-              </article>
-            ))}
+                          {jobUsesWallet3(job) && (
+                            <button
+                              type="button"
+                              className="button secondary"
+                              disabled={Boolean(manualBuyBusy) || Boolean(finishBusy)}
+                              onClick={() => void manualBuy(job, 3)}
+                            >
+                              {manualBuyBusy === `${job.jobId}:3`
+                                ? 'Buying…'
+                                : `Buy W3 (${job.input.buyEthAmount} ETH)`}
+                            </button>
+                          )}
+                        </>
+                      )}
+                      {canFinish(job) && (
+                        <button
+                          type="button"
+                          className="button secondary danger-outline"
+                          disabled={Boolean(manualBuyBusy) || finishBusy === job.jobId}
+                          onClick={() => void finishLaunch(job)}
+                        >
+                          {finishBusy === job.jobId ? 'Finishing…' : 'Finish'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {(job.tokenAddress || txChips.length > 0) && (
+                    <div className="tl-chips tl-tx-chips">
+                      {job.tokenAddress && (
+                        <a className="tl-chip" href={baseScanAddress(job.tokenAddress)} target="_blank" rel="noreferrer">
+                          token {shortId(job.tokenAddress)}
+                        </a>
+                      )}
+                      {job.poolAddress && (
+                        <a className="tl-chip" href={baseScanAddress(job.poolAddress)} target="_blank" rel="noreferrer">
+                          pool {shortId(job.poolAddress)}
+                        </a>
+                      )}
+                      {txChips.map((tx) => (
+                        <a
+                          key={tx.label}
+                          className="tl-chip"
+                          href={baseScanTx(tx.hash)}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {tx.label} {shortId(tx.hash)}
+                        </a>
+                      ))}
+                    </div>
+                  )}
+
+                  {job.tokenAddress && job.poolAddress && (
+                    <p style={{ marginTop: 12 }}>
+                      <Link to={`/tokenlaunch/${job.jobId}`} className="back-link" style={{ marginBottom: 0 }}>
+                        View analyzer
+                        {job.trades && job.trades.length > 0 ? ` (${job.trades.length} trades)` : ''}
+                      </Link>
+                    </p>
+                  )}
+
+                  {job.error && <p className="error">{job.error}</p>}
+                </article>
+              );
+            })}
           </div>
         )}
-        <p className="subtle" style={{ marginTop: 12 }}>
-          <Link to="/orders">View all activity</Link>
-        </p>
+        {historyPageCount > 1 && (
+          <div className="tl-pager">
+            <button
+              type="button"
+              className="button secondary"
+              disabled={currentHistoryPage <= 1}
+              onClick={() => setHistoryPage((page) => Math.max(1, page - 1))}
+            >
+              ← Prev
+            </button>
+            <span className="tl-pager-info">
+              Page {currentHistoryPage} / {historyPageCount}
+              <span className="subtle"> · {jobs.length} total</span>
+            </span>
+            <button
+              type="button"
+              className="button secondary"
+              disabled={currentHistoryPage >= historyPageCount}
+              onClick={() => setHistoryPage((page) => Math.min(historyPageCount, page + 1))}
+            >
+              Next →
+            </button>
+          </div>
+        )}
       </section>
+      </div>
+
+      <aside className="tl-sidebar">
+        <div className="tl-side-card">
+          <div className="tl-side-head">
+            <span className="tl-side-title">Wallets</span>
+            <button
+              type="button"
+              className="tl-side-refresh"
+              onClick={() => void reloadStatus()}
+              disabled={loading}
+              aria-label="Refresh balances"
+            >
+              {loading ? '…' : '↻'}
+            </button>
+          </div>
+          {loading ? (
+            <div className="tl-wrows">
+              <div className="tl-wrow tl-skeleton" />
+              <div className="tl-wrow tl-skeleton" />
+              <div className="tl-wrow tl-skeleton" />
+            </div>
+          ) : configured ? (
+            <div className="tl-wrows">
+              {wallets.map((wallet) => (
+                <WalletRow key={wallet.index} wallet={wallet} />
+              ))}
+            </div>
+          ) : (
+            <p className="tl-wrow-off">Set wallet keys in backend/.env to see balances.</p>
+          )}
+          {configured && <p className="tl-side-rpc mono">RPC · {rpcUrl}</p>}
+        </div>
+      </aside>
     </main>
   );
 }

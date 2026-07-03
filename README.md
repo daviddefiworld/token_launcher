@@ -15,13 +15,23 @@ Standalone no-auth automation system for a dashboard, backend, and browser exten
 
 ## Commands
 
-Run these in separate terminals:
+One-time install of all workspaces (root + backend + dashboard + extension):
 
 ```bash
-npm --prefix backend install
-npm --prefix dashboard install
-npm --prefix extension install
+npm run install:all
+```
 
+Then start everything (backend, dashboard, and extension watcher) with a single command:
+
+```bash
+npm run dev
+```
+
+`npm run dev` runs all three together with labeled output; press `Ctrl+C` once to stop them all. Build everything for production with `npm run build`.
+
+To run a single piece in its own terminal instead:
+
+```bash
 npm run backend:dev
 npm run dashboard:dev
 npm run extension:dev

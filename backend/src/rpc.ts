@@ -9,7 +9,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 export function getBaseRpcUrl(): string {
-  return process.env.BASE_RPC_URL?.trim() || 'https://mainnet.base.org';
+  return process.env.BASE_RPC_URL?.trim() || 'https://rpc.mainnet.chain.robinhood.com';
 }
 
 export function createBasePublicClient() {

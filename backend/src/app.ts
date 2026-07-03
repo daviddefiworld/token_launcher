@@ -132,7 +132,7 @@ class ActivityFeed {
       extensionId: 'tokenlaunch',
       status: job.status,
       title: `Token launch: ${job.input.tokenName}`,
-      summary: `${job.input.lpEthAmount} ETH LP on Base · ${job.phase || job.status}`,
+      summary: `${job.input.dex === 'uniswap' ? 'Uniswap V2' : 'Aerodrome'} · ${job.input.lpEthAmount} ETH LP on Base · ${job.phase || job.status}`,
       tokenLaunch: {
         tokenName: job.input.tokenName,
         tokenSymbol: job.input.tokenSymbol,

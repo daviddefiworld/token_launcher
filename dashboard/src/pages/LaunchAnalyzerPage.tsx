@@ -127,8 +127,12 @@ export function LaunchAnalyzerPage() {
                   <strong>{tradesData.stats.sells}</strong>
                 </div>
                 <div>
-                  <span className="analyzer-stat-label">External buyers</span>
+                  <span className="analyzer-stat-label">External buyers (seen)</span>
                   <strong>{tradesData.stats.externalBuyers}</strong>
+                </div>
+                <div>
+                  <span className="analyzer-stat-label">Detected buyers (≥ 0.0001 Ξ)</span>
+                  <strong>{tradesData.stats.qualifyingBuyers}</strong>
                 </div>
                 <div>
                   <span className="analyzer-stat-label">External sellers</span>
@@ -224,6 +228,15 @@ function TradeRow({ trade }: { trade: PoolTrade }) {
       <td>
         <span className={sideClass}>{trade.side}</span>
         {trade.isOwnWallet && <span className="pill muted" style={{ marginLeft: 6 }}>own</span>}
+        {trade.side === 'buy' && trade.belowDetectionThreshold && (
+          <span
+            className="pill warning"
+            style={{ marginLeft: 6 }}
+            title="Below 0.0001 ETH — shown but ignored for buyer detection"
+          >
+            dust
+          </span>
+        )}
       </td>
       <td className="mono">
         <a href={baseScanAddress(trade.trader)} target="_blank" rel="noreferrer">

@@ -9,10 +9,11 @@ import {
   type LaunchWorkflowInput,
   type TokenLaunchInput
 } from '../api';
-import type { ExtensionRecord, LaunchWorkflow, LaunchWorkflowStatus } from '../types';
+import type { DexKey, ExtensionRecord, LaunchWorkflow, LaunchWorkflowStatus } from '../types';
 import { canDepositWorkflow, formatRelativeTime, shortId } from '../utils';
 
 const DEFAULT_TOKEN_LAUNCH: TokenLaunchInput = {
+  dex: 'uniswap',
   tokenName: 'AI',
   tokenSymbol: 'AI',
   lpEthAmount: '0.01',
@@ -215,6 +216,17 @@ export function WorkflowPage({
                 disabled={busy || hasActiveWorkflow || !autoStartLaunch}
               />
               Analyze trades when launch finishes
+            </label>
+            <label>
+              DEX
+              <select
+                value={tokenLaunch.dex}
+                onChange={(e) => updateTokenLaunch('dex', e.target.value as DexKey)}
+                disabled={busy || hasActiveWorkflow}
+              >
+                <option value="uniswap">Uniswap V2</option>
+                <option value="aerodrome">Aerodrome</option>
+              </select>
             </label>
             <label>
               Token name

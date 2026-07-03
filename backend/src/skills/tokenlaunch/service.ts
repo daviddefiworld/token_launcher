@@ -29,30 +29,29 @@ import {
 } from './swaps';
 import { TokenLaunchRepository, nowIso } from '../../persist';
 import {
-  AERODROME,
   BASE_CHAIN,
   DEFAULT_BUY_ETH,
   DEFAULT_LP_ETH,
   DEFAULT_MIN_BUYERS_BEFORE_REMOVE_LP,
   DEFAULT_REMOVE_LP_TIME_MINUTES,
-  DEFAULT_TOKEN_SUPPLY,
   MAX_MIN_BUYERS_BEFORE_REMOVE_LP,
   MAX_REMOVE_LP_TIME_MINUTES,
   DEFAULT_BUY_AFTER_SECONDS,
   MAX_BUY_AFTER_SECONDS,
   SWAP_POLL_MS,
-  aerodromeFactoryAbi,
-  aerodromePoolAbi,
-  aerodromeRouterAbi,
   wethAbi
 } from './config';
-import { launchTokenAbi, launchTokenBytecode } from './contracts';
+import { DEFAULT_DEX, DEX_ADAPTERS, getDexAdapter, type DexAdapter, type DexKey } from './dex';
+import { feeTokenAbi, feeTokenBytecode } from './contracts';
 
 export type TokenLaunchBroadcast = (job: TokenLaunchJob, event: 'created' | 'updated') => void;
 
 const MAX_REPEAT_COUNT = 50;
 const REPEAT_DELAY_MS = 3_000;
 const LP_SCAN_DELAY_MS = 800;
+// Cap how long we wait on a removal-path receipt so a stuck/dropped tx surfaces an error
+// instead of hanging the request indefinitely.
+const REMOVE_RECEIPT_TIMEOUT_MS = 90_000;
 const TRADES_BACKFILL_JOB_DELAY_MS = 1_200;
 const TRADES_BACKFILL_START_DELAY_MS = 8_000;
 
@@ -86,6 +85,14 @@ function resolveBuyAfterMs(input: TokenLaunchInput): number {
 }
 const MAX_UINT256 = 2n ** 256n - 1n;
 const RPC_RETRY_ATTEMPTS = 5;
+// First-time addLiquidity deploys a brand-new pair/pool via CREATE2 (~2.5-3M gas). The
+// fallback floor (used when gas estimation fails) must comfortably cover that, otherwise a
+// failed estimate drops to a too-low limit and the tx reverts out-of-gas mid pair-creation.
+const ADD_LIQUIDITY_GAS_FLOOR = 4_000_000n;
+// Estimation can transiently revert right after the approve receipt (the estimating node may
+// not see the fresh allowance yet); retry a few times before falling back to the floor.
+const GAS_ESTIMATE_ATTEMPTS = 3;
+const GAS_ESTIMATE_RETRY_MS = 700;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -123,6 +130,26 @@ function isRateLimitError(error: unknown): boolean {
   return message.includes('429') || message.includes('rate limit') || message.includes('-32016');
 }
 
+// Number of times to re-sync the nonce from chain and resend after a nonce mismatch.
+const NONCE_RETRY_ATTEMPTS = 6;
+const NONCE_RETRY_MS = 400;
+
+// A nonce-too-low/high collision is recoverable by re-reading getTransactionCount and resending;
+// the public Base RPC is multi-node and can report a stale (already-used) pending nonce right
+// after a receipt resolves on a different node. Includes the neighbouring mempool errors that a
+// stale or duplicate nonce can surface as.
+function isNonceError(error: unknown): boolean {
+  const message = formatViemError(error).toLowerCase();
+  return (
+    message.includes('nonce too low') ||
+    message.includes('nonce too high') ||
+    message.includes('next nonce') ||
+    message.includes('invalid nonce') ||
+    message.includes('already known') ||
+    message.includes('replacement transaction underpriced')
+  );
+}
+
 async function withRpcRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= RPC_RETRY_ATTEMPTS; attempt += 1) {
@@ -143,8 +170,22 @@ function receiptFailureMessage(label: string, receipt: TransactionReceipt, txHas
   return `${label}${hint} · tx ${txHash}`;
 }
 
+interface PoolCandidateMeta {
+  tokenAddress?: Address;
+  jobIds: string[];
+  tokenName?: string;
+  tokenSymbol?: string;
+  dex: DexKey;
+}
+
 export class TokenLaunchService {
   private readonly running = new Set<string>();
+  // Serializes outbound transactions per sending account so concurrent callers (e.g. an active
+  // launch and an on-demand LP removal both using wallet 1) can't grab the same nonce.
+  private readonly nonceQueue = new Map<Address, Promise<unknown>>();
+  // Monotonic next-nonce per account. Guards against the load-balanced Base RPC returning a stale,
+  // already-used pending nonce immediately after a receipt resolves on another node.
+  private readonly nonceCursor = new Map<Address, number>();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private publicClient: any = null;
   private wallet1: WalletClient | null = null;
@@ -240,7 +281,7 @@ export class TokenLaunchService {
     wallet3Configured: boolean;
     rpcUrl: string;
   }> {
-    const rpcUrl = process.env.BASE_RPC_URL?.trim() || 'https://mainnet.base.org';
+    const rpcUrl = process.env.BASE_RPC_URL?.trim() || 'https://rpc.mainnet.chain.robinhood.com';
     const keys = this.resolveWalletKeys();
     if (!keys.wallet1 || !keys.wallet2) {
       return { configured: false, wallet3Configured: Boolean(keys.wallet3), rpcUrl };
@@ -393,6 +434,7 @@ export class TokenLaunchService {
     }
 
     const publicClient = this.publicClient!;
+    const adapter = getDexAdapter(job.input.dex);
     const tokenAddress = getAddress(job.tokenAddress);
     const poolAddress = getAddress(job.poolAddress);
     const sinceMs = new Date(job.createdAt).getTime() - 60_000;
@@ -406,7 +448,7 @@ export class TokenLaunchService {
     );
 
     const fetched = await withRpcRetry(`pool trades for ${jobId}`, () =>
-      fetchPoolTrades(publicClient, poolAddress, tokenAddress, fromBlock, this.getOurWalletSet())
+      fetchPoolTrades(publicClient, adapter, poolAddress, tokenAddress, fromBlock, this.getOurWalletSet())
     );
 
     const trades = mergeTrades(job.trades ?? [], fetched);
@@ -471,8 +513,9 @@ export class TokenLaunchService {
       const amount = parseEther(amountLabel);
       if (amount <= 0n) throw new Error('ethAmount must be greater than 0');
 
+      const adapter = getDexAdapter(job.input.dex);
       const tokenAddress = getAddress(job.tokenAddress);
-      const txHash = await this.swapEthForToken(wallet, tokenAddress, amount);
+      const txHash = await this.swapEthForToken(adapter, wallet, tokenAddress, amount);
       const patch: Partial<TokenLaunchJob> = {
         phase: `Manual wallet ${wallet} buy complete (${amountLabel} ETH)`
       };
@@ -574,7 +617,7 @@ export class TokenLaunchService {
       throw new Error('Wallet 1 and wallet 2 private keys must be configured');
     }
 
-    const rpcUrl = process.env.BASE_RPC_URL?.trim() || 'https://mainnet.base.org';
+    const rpcUrl = process.env.BASE_RPC_URL?.trim() || 'https://rpc.mainnet.chain.robinhood.com';
     const transport = http(rpcUrl);
     this.publicClient = createPublicClient({ chain: BASE_CHAIN, transport });
     const account1 = privateKeyToAccount(normalizePrivateKey(wallet1Key));
@@ -623,15 +666,14 @@ export class TokenLaunchService {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     publicClient: any,
     wallet1Address: Address,
-    tokenName: string,
-    tokenSymbol: string,
     lpEthAmount: string
   ): Promise<void> {
     const balance = await publicClient.getBalance({ address: wallet1Address });
+    // feeToken (AS) has a no-arg constructor; the deploy also creates the Uniswap V2 pair.
     const deployData = encodeDeployData({
-      abi: launchTokenAbi,
-      bytecode: launchTokenBytecode,
-      args: [tokenName, tokenSymbol, DEFAULT_TOKEN_SUPPLY]
+      abi: feeTokenAbi,
+      bytecode: feeTokenBytecode,
+      args: []
     });
 
     let gasEstimate: bigint;
@@ -647,18 +689,25 @@ export class TokenLaunchService {
     const gasPrice = await publicClient.getGasPrice();
     const deployCost = gasWithBuffer(gasEstimate, 500_000n) * gasPrice;
     const lpEth = parseEther(lpEthAmount);
-    const postDeployGas = 1_200_000n * gasPrice;
+    // Covers the token approval plus the addLiquidity gas reservation (which can be pre-charged
+    // at the full limit on submission), so the up-front balance check matches what's needed.
+    const postDeployGas = (ADD_LIQUIDITY_GAS_FLOOR + 300_000n) * gasPrice;
     const required = deployCost + lpEth + postDeployGas;
 
     if (balance < required) {
       throw new Error(
-        `Wallet 1 needs at least ${(Number(required) / 1e18).toFixed(6)} ETH on Base ` +
+        `Wallet 1 needs at least ${(Number(required) / 1e18).toFixed(6)} ETH on Robinhood ` +
           `(${lpEthAmount} ETH LP + deploy/post-deploy gas; balance ${(Number(balance) / 1e18).toFixed(6)} ETH)`
       );
     }
   }
 
-  private async swapEthForToken(wallet: 2 | 3, tokenAddress: Address, buyEth: bigint): Promise<`0x${string}`> {
+  private async swapEthForToken(
+    adapter: DexAdapter,
+    wallet: 2 | 3,
+    tokenAddress: Address,
+    buyEth: bigint
+  ): Promise<`0x${string}`> {
     const publicClient = this.publicClient!;
     if (wallet === 3 && !this.wallet3) {
       throw new Error('Wallet 3 is not configured (set WALLET_3_PRIVATE_KEY in backend/.env)');
@@ -666,36 +715,189 @@ export class TokenLaunchService {
     const walletClient = wallet === 2 ? this.wallet2! : this.wallet3!;
     const account = wallet === 2 ? this.wallet2Account! : this.wallet3Account!;
     const recipient = wallet === 2 ? this.wallet2Address! : this.wallet3Address!;
-    const route = [{ from: AERODROME.weth, to: tokenAddress, stable: false, factory: AERODROME.factory }] as const;
-    const swapArgs = [0n, route, recipient, deadline()] as const;
+    const swapArgs = adapter.swapExactEthForTokensArgs({
+      amountOutMin: 0n,
+      token: tokenAddress,
+      to: recipient,
+      deadline: deadline()
+    });
 
     const buyGas = await this.estimateWriteGas(
       publicClient,
       {
         account: recipient,
-        address: AERODROME.router,
-        abi: aerodromeRouterAbi,
-        functionName: 'swapExactETHForTokens',
+        address: adapter.router,
+        abi: adapter.routerAbi,
+        functionName: adapter.swapFunctionName,
         args: swapArgs,
         value: buyEth
       },
       350_000n
     );
-    const buyHash = await walletClient.writeContract({
-      account,
-      chain: BASE_CHAIN,
-      address: AERODROME.router,
-      abi: aerodromeRouterAbi,
-      functionName: 'swapExactETHForTokens',
-      args: swapArgs,
-      value: buyEth,
-      gas: buyGas
-    });
+    const buyHash = await this.sendTx(account, (nonce) =>
+      walletClient.writeContract({
+        account,
+        chain: BASE_CHAIN,
+        address: adapter.router,
+        abi: adapter.routerAbi,
+        functionName: adapter.swapFunctionName,
+        args: swapArgs,
+        value: buyEth,
+        gas: buyGas,
+        nonce
+      })
+    );
     const receipt = await publicClient.waitForTransactionReceipt({ hash: buyHash });
     if (receipt.status !== 'success') {
       throw new Error(receiptFailureMessage(`Wallet ${wallet} buy failed`, receipt, buyHash));
     }
     return buyHash;
+  }
+
+  /**
+   * Call the fee token's owner-only `isNotRestricted()` to set max tx / max wallet to the full
+   * supply, removing the 2% caps that would otherwise revert real and own-wallet buys. Sent from
+   * wallet 1 (the deployer/owner).
+   */
+  private async removeTokenLimits(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    publicClient: any,
+    wallet1: WalletClient,
+    wallet1Account: NonNullable<TokenLaunchService['wallet1Account']>,
+    wallet1Address: Address,
+    tokenAddress: Address
+  ): Promise<void> {
+    const gas = await this.estimateWriteGas(
+      publicClient,
+      {
+        account: wallet1Address,
+        address: tokenAddress,
+        abi: feeTokenAbi,
+        functionName: 'isNotRestricted'
+      },
+      80_000n
+    );
+    const hash = await this.sendTx(wallet1Account, (nonce) =>
+      wallet1.writeContract({
+        account: wallet1Account,
+        chain: BASE_CHAIN,
+        address: tokenAddress,
+        abi: feeTokenAbi,
+        functionName: 'isNotRestricted',
+        gas,
+        nonce
+      })
+    );
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== 'success') {
+      throw new Error(receiptFailureMessage('Remove token limits (isNotRestricted) failed', receipt, hash));
+    }
+  }
+
+  /**
+   * Best-effort: lift a fee token's max-wallet/tx caps before an LP removal. With limits active,
+   * the pair->router burn transfer exceeds max-wallet and the removal reverts with
+   * "UniswapV2: TRANSFER_FAILED". Guarded so it only sends a tx when the token actually has active
+   * limits and wallet 1 can lift them (owner) — a no-op for already-lifted or non-fee tokens.
+   */
+  private async tryLiftTokenLimits(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    publicClient: any,
+    wallet1: WalletClient,
+    wallet1Account: NonNullable<TokenLaunchService['wallet1Account']>,
+    wallet1Address: Address,
+    tokenAddress: Address
+  ): Promise<void> {
+    try {
+      const [maxWallet, supply] = (await Promise.all([
+        publicClient.readContract({ address: tokenAddress, abi: feeTokenAbi, functionName: '_maxWalletSize' }),
+        publicClient.readContract({ address: tokenAddress, abi: feeTokenAbi, functionName: 'totalSupply' })
+      ])) as [bigint, bigint];
+      if (maxWallet >= supply) return; // already unrestricted
+    } catch {
+      return; // token lacks these accessors (not the fee token) — nothing to lift
+    }
+
+    const request = {
+      account: wallet1Address,
+      address: tokenAddress,
+      abi: feeTokenAbi,
+      functionName: 'isNotRestricted'
+    };
+    if (!(await this.canSimulate(publicClient, request))) return; // e.g. wallet 1 is not the owner
+
+    try {
+      const gas = await this.estimateWriteGas(publicClient, request, 80_000n);
+      const hash = await this.sendTx(wallet1Account, (nonce) =>
+        wallet1.writeContract({
+          account: wallet1Account,
+          chain: BASE_CHAIN,
+          address: tokenAddress,
+          abi: feeTokenAbi,
+          functionName: 'isNotRestricted',
+          gas,
+          nonce
+        })
+      );
+      await publicClient.waitForTransactionReceipt({ hash, timeout: REMOVE_RECEIPT_TIMEOUT_MS });
+    } catch (error) {
+      console.warn(`Lift token limits before removal failed for ${tokenAddress}:`, formatViemError(error));
+    }
+  }
+
+  /**
+   * Broadcast a write transaction with an explicit, collision-safe nonce. `send` receives the
+   * nonce to attach (pass it straight to writeContract/deployContract) and returns the tx hash.
+   * Sends from the same account are serialized; on a nonce mismatch we re-sync from chain and
+   * resend. This does NOT wait for the receipt — callers await that as before.
+   */
+  private async sendTx(
+    account: ReturnType<typeof privateKeyToAccount>,
+    send: (nonce: number) => Promise<`0x${string}`>
+  ): Promise<`0x${string}`> {
+    const address = account.address;
+    const prior = this.nonceQueue.get(address) ?? Promise.resolve();
+    const run = prior.then(
+      () => this.sendTxSerialized(address, send),
+      () => this.sendTxSerialized(address, send)
+    );
+    // Keep the queue tail non-throwing so one failed send doesn't poison later ones.
+    this.nonceQueue.set(
+      address,
+      run.then(
+        () => undefined,
+        () => undefined
+      )
+    );
+    return run;
+  }
+
+  private async sendTxSerialized(
+    address: Address,
+    send: (nonce: number) => Promise<`0x${string}`>
+  ): Promise<`0x${string}`> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= NONCE_RETRY_ATTEMPTS; attempt += 1) {
+      const onchain = Number(
+        await this.publicClient.getTransactionCount({ address, blockTag: 'pending' })
+      );
+      const local = this.nonceCursor.get(address) ?? 0;
+      // Never go below our own last-used nonce: a lagging RPC node can report a stale-low pending
+      // count right after a receipt, which is exactly what triggers "nonce too low".
+      const nonce = Math.max(onchain, local);
+      try {
+        const hash = await send(nonce);
+        this.nonceCursor.set(address, nonce + 1);
+        return hash;
+      } catch (error) {
+        lastError = error;
+        if (!isNonceError(error) || attempt === NONCE_RETRY_ATTEMPTS) break;
+        // Re-sync from chain next iteration and let the lagging node catch up.
+        this.nonceCursor.delete(address);
+        await sleep(NONCE_RETRY_MS * attempt);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(`Transaction send failed: ${String(lastError)}`);
   }
 
   private async estimateWriteGas(
@@ -704,11 +906,28 @@ export class TokenLaunchService {
     request: Parameters<typeof publicClient.estimateContractGas>[0],
     floor: bigint
   ): Promise<bigint> {
+    for (let attempt = 1; attempt <= GAS_ESTIMATE_ATTEMPTS; attempt += 1) {
+      try {
+        const estimate = await publicClient.estimateContractGas(request);
+        return gasWithBuffer(estimate, floor);
+      } catch {
+        if (attempt < GAS_ESTIMATE_ATTEMPTS) await sleep(GAS_ESTIMATE_RETRY_MS);
+      }
+    }
+    return floor;
+  }
+
+  /** True if the contract write would succeed against current state (gas estimation doesn't revert). */
+  private async canSimulate(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    publicClient: any,
+    request: Parameters<typeof publicClient.estimateContractGas>[0]
+  ): Promise<boolean> {
     try {
-      const estimate = await publicClient.estimateContractGas(request);
-      return gasWithBuffer(estimate, floor);
+      await publicClient.estimateContractGas(request);
+      return true;
     } catch {
-      return floor;
+      return false;
     }
   }
 
@@ -723,27 +942,26 @@ export class TokenLaunchService {
       const wallet2Address = this.wallet2Address!;
       const job = this.repository.get(jobId);
       if (!job) return;
+      const adapter = getDexAdapter(job.input.dex);
 
       this.patch(jobId, { status: 'deploying', phase: 'Deploying token' });
 
-      const tokenAmount = DEFAULT_TOKEN_SUPPLY / 2n;
       const wallet1Account = this.wallet1Account!;
 
-      await this.ensureDeployReady(
-        publicClient,
-        wallet1Address,
-        job.input.tokenName,
-        job.input.tokenSymbol,
-        job.input.lpEthAmount
-      );
+      await this.ensureDeployReady(publicClient, wallet1Address, job.input.lpEthAmount);
 
-      const deployHash = await wallet1.deployContract({
-        account: wallet1Account,
-        chain: BASE_CHAIN,
-        abi: launchTokenAbi,
-        bytecode: launchTokenBytecode,
-        args: [job.input.tokenName, job.input.tokenSymbol, DEFAULT_TOKEN_SUPPLY]
-      });
+      // feeToken (AS) constructor takes no args — name/symbol/supply are hardcoded in the
+      // contract (Asteroid Shiba / ASTEROID, 9 decimals) and it creates the V2 pair itself.
+      const deployHash = await this.sendTx(wallet1Account, (nonce) =>
+        wallet1.deployContract({
+          account: wallet1Account,
+          chain: BASE_CHAIN,
+          abi: feeTokenAbi,
+          bytecode: feeTokenBytecode,
+          args: [],
+          nonce
+        })
+      );
 
       const deployReceipt = await publicClient.waitForTransactionReceipt({ hash: deployHash });
       if (deployReceipt.status !== 'success') {
@@ -760,63 +978,95 @@ export class TokenLaunchService {
         deployTxHash: deployHash,
         deployBlockNumber: Number(deployReceipt.blockNumber),
         status: 'adding_liquidity',
-        phase: 'Creating Aerodrome LP'
+        phase: `Creating ${adapter.label} LP`
       });
+
+      // Deployer (wallet 1) is minted the entire supply and is tax-exempt in the contract,
+      // so adding liquidity from it incurs no transfer fee. Put all of it into the LP.
+      const tokenAmount = (await publicClient.readContract({
+        address: tokenAddress,
+        abi: feeTokenAbi,
+        functionName: 'balanceOf',
+        args: [wallet1Address]
+      })) as bigint;
+      if (tokenAmount <= 0n) {
+        throw new Error('Deployer holds no token balance after deploy');
+      }
 
       const approveGas = await this.estimateWriteGas(
         publicClient,
         {
           account: wallet1Address,
           address: tokenAddress,
-          abi: launchTokenAbi,
+          abi: feeTokenAbi,
           functionName: 'approve',
-          args: [AERODROME.router, tokenAmount]
+          args: [adapter.router, tokenAmount]
         },
         80_000n
       );
-      const approveHash = await wallet1.writeContract({
-        account: wallet1Account,
-        chain: BASE_CHAIN,
-        address: tokenAddress,
-        abi: launchTokenAbi,
-        functionName: 'approve',
-        args: [AERODROME.router, tokenAmount],
-        gas: approveGas
-      });
+      const approveHash = await this.sendTx(wallet1Account, (nonce) =>
+        wallet1.writeContract({
+          account: wallet1Account,
+          chain: BASE_CHAIN,
+          address: tokenAddress,
+          abi: feeTokenAbi,
+          functionName: 'approve',
+          args: [adapter.router, tokenAmount],
+          gas: approveGas,
+          nonce
+        })
+      );
       const approveReceipt = await publicClient.waitForTransactionReceipt({ hash: approveHash });
       if (approveReceipt.status !== 'success') {
-        throw new Error(receiptFailureMessage('Token approval for Aerodrome router failed', approveReceipt, approveHash));
+        throw new Error(
+          receiptFailureMessage(`Token approval for ${adapter.label} router failed`, approveReceipt, approveHash)
+        );
       }
 
       const lpEth = parseEther(job.input.lpEthAmount);
+      const addLiquidityArgs = adapter.addLiquidityEthArgs({
+        token: tokenAddress,
+        tokenAmount,
+        amountTokenMin: 0n,
+        amountEthMin: 0n,
+        to: wallet1Address,
+        deadline: deadline()
+      });
       const addLiquidityGas = await this.estimateWriteGas(
         publicClient,
         {
           account: wallet1Address,
-          address: AERODROME.router,
-          abi: aerodromeRouterAbi,
+          address: adapter.router,
+          abi: adapter.routerAbi,
           functionName: 'addLiquidityETH',
-          args: [tokenAddress, false, tokenAmount, 0n, 0n, wallet1Address, deadline()],
+          args: addLiquidityArgs,
           value: lpEth
         },
-        1_200_000n
+        ADD_LIQUIDITY_GAS_FLOOR
       );
-      const addLiquidityHash = await wallet1.writeContract({
-        account: wallet1Account,
-        chain: BASE_CHAIN,
-        address: AERODROME.router,
-        abi: aerodromeRouterAbi,
-        functionName: 'addLiquidityETH',
-        args: [tokenAddress, false, tokenAmount, 0n, 0n, wallet1Address, deadline()],
-        value: lpEth,
-        gas: addLiquidityGas
-      });
+      const addLiquidityHash = await this.sendTx(wallet1Account, (nonce) =>
+        wallet1.writeContract({
+          account: wallet1Account,
+          chain: BASE_CHAIN,
+          address: adapter.router,
+          abi: adapter.routerAbi,
+          functionName: 'addLiquidityETH',
+          args: addLiquidityArgs,
+          value: lpEth,
+          gas: addLiquidityGas,
+          nonce
+        })
+      );
       const addLiquidityReceipt = await publicClient.waitForTransactionReceipt({ hash: addLiquidityHash });
       if (addLiquidityReceipt.status !== 'success') {
         throw new Error(receiptFailureMessage('Add liquidity transaction failed', addLiquidityReceipt, addLiquidityHash));
       }
 
-      const poolAddress = await this.resolvePoolAddress(publicClient, tokenAddress, addLiquidityReceipt);
+      // Lift the fee token's 2% max-tx / max-wallet caps (owner-only). Without this, any
+      // non-trivial buy reverts with "Exceeds the _maxTxAmount." since all supply is in the LP.
+      await this.removeTokenLimits(publicClient, wallet1, wallet1Account, wallet1Address, tokenAddress);
+
+      const poolAddress = await this.resolvePoolAddress(publicClient, adapter, tokenAddress, addLiquidityReceipt);
 
       const monitorStartedAt = Date.now();
       this.patch(jobId, {
@@ -826,7 +1076,10 @@ export class TokenLaunchService {
         phase: 'Monitoring buyers'
       });
 
+      // buyerCount = external buyers seen (incl. sub-threshold dust, for display);
+      // qualifyingBuyers = buyers meeting MIN_DETECTION_BUY_ETH, which actually drive detection.
       let buyerCount = 0;
+      let qualifyingBuyers = 0;
       let lpRemoved = false;
       let wallet2BuyExecuted = false;
       let wallet3BuyExecuted = false;
@@ -840,10 +1093,13 @@ export class TokenLaunchService {
       const wallet2BuyEth = resolveWallet2BuyEthAmount(job.input);
 
       const buyerThresholdMet = (count: number) => count >= minBuyersBeforeRemoveLp;
-      const buyerMonitorPhase = (count: number) =>
-        minBuyersBeforeRemoveLp > 1
-          ? `Monitoring buyers (${count}/${minBuyersBeforeRemoveLp} for early exit)`
-          : `Monitoring buyers (${count} detected)`;
+      const buyerMonitorPhase = () => {
+        const dust = buyerCount - qualifyingBuyers;
+        const seenLabel = dust > 0 ? ` · ${dust} dust ignored` : '';
+        return minBuyersBeforeRemoveLp > 1
+          ? `Monitoring buyers (${qualifyingBuyers}/${minBuyersBeforeRemoveLp} for early exit${seenLabel})`
+          : `Monitoring buyers (${qualifyingBuyers} detected${seenLabel})`;
+      };
 
       const removeLiquidity = async (reason: string): Promise<void> => {
         if (lpRemoved) return;
@@ -851,6 +1107,7 @@ export class TokenLaunchService {
 
         const removeHash = await this.removePoolLiquidity(
           publicClient,
+          adapter,
           wallet1,
           wallet1Account,
           wallet1Address,
@@ -872,16 +1129,17 @@ export class TokenLaunchService {
         try {
           const synced = await this.syncTrades(jobId);
           buyerCount = synced.stats.externalBuyers;
+          qualifyingBuyers = synced.stats.qualifyingBuyers;
         } catch (error) {
           console.error(`Trade sync failed for ${jobId}:`, formatViemError(error));
         }
-        this.patch(jobId, { buyerCount, phase: buyerMonitorPhase(buyerCount) });
+        this.patch(jobId, { buyerCount, phase: buyerMonitorPhase() });
 
-        if (buyerThresholdMet(buyerCount)) {
+        if (buyerThresholdMet(qualifyingBuyers)) {
           if (shouldRemoveLp) {
             await removeLiquidity(
               minBuyersBeforeRemoveLp > 1
-                ? `Removing LP after ${buyerCount} buyers (min ${minBuyersBeforeRemoveLp})`
+                ? `Removing LP after ${qualifyingBuyers} buyers (min ${minBuyersBeforeRemoveLp})`
                 : 'Removing LP after buyer detected'
             );
             this.patch(jobId, {
@@ -890,7 +1148,7 @@ export class TokenLaunchService {
               buyerCount,
               phase:
                 minBuyersBeforeRemoveLp > 1
-                  ? `Completed — LP removed after ${buyerCount} buyers`
+                  ? `Completed — LP removed after ${qualifyingBuyers} buyers`
                   : 'Completed — LP removed after buyer',
               completedAt: nowIso()
             });
@@ -900,7 +1158,7 @@ export class TokenLaunchService {
               buyerCount,
               phase:
                 minBuyersBeforeRemoveLp > 1
-                  ? `Completed — ${buyerCount} buyers, LP kept (remove manually)`
+                  ? `Completed — ${qualifyingBuyers} buyers, LP kept (remove manually)`
                   : 'Completed — buyer detected, LP kept (remove manually)',
               completedAt: nowIso()
             });
@@ -908,10 +1166,10 @@ export class TokenLaunchService {
           return;
         }
 
-        if (!wallet2BuyExecuted && buyerCount === 0 && elapsed >= buyAfterMs) {
+        if (!wallet2BuyExecuted && qualifyingBuyers === 0 && elapsed >= buyAfterMs) {
           const buyLabel = useWallet3 ? 'wallets 2 & 3' : 'wallet 2';
           this.patch(jobId, { status: 'buying', phase: `No buyers — buying with ${buyLabel}` });
-          const buy2Hash = await this.swapEthForToken(2, tokenAddress, parseEther(wallet2BuyEth));
+          const buy2Hash = await this.swapEthForToken(adapter, 2, tokenAddress, parseEther(wallet2BuyEth));
           wallet2BuyExecuted = true;
           const patch: Partial<TokenLaunchJob> = {
             buyTxHash: buy2Hash,
@@ -922,7 +1180,7 @@ export class TokenLaunchService {
               : `Wallet 2 buy complete — monitoring until ${removeLpTimeLabel}`
           };
           if (useWallet3) {
-            const buy3Hash = await this.swapEthForToken(3, tokenAddress, parseEther(job.input.buyEthAmount));
+            const buy3Hash = await this.swapEthForToken(adapter, 3, tokenAddress, parseEther(job.input.buyEthAmount));
             wallet3BuyExecuted = true;
             patch.wallet3BuyTxHash = buy3Hash;
             patch.wallet3BuyExecuted = true;
@@ -971,27 +1229,25 @@ export class TokenLaunchService {
     }
   }
 
-  private poolFromReceipt(receipt: TransactionReceipt, tokenAddress: Address): Address | null {
+  private poolFromReceipt(adapter: DexAdapter, receipt: TransactionReceipt, tokenAddress: Address): Address | null {
     for (const log of receipt.logs) {
-      if (getAddress(log.address) !== getAddress(AERODROME.factory)) continue;
+      if (getAddress(log.address) !== getAddress(adapter.factory)) continue;
       try {
         const decoded = decodeEventLog({
-          abi: aerodromeFactoryAbi,
+          abi: adapter.factoryAbi,
           data: log.data,
           topics: log.topics
         });
-        if (decoded.eventName !== 'PoolCreated') continue;
-        const { pool, token0, token1 } = decoded.args as {
-          pool: Address;
-          token0: Address;
-          token1: Address;
-        };
+        if (decoded.eventName !== adapter.poolCreatedEventName) continue;
+        const { pool, token0, token1 } = adapter.parseCreatedPool(
+          decoded.args as unknown as Record<string, unknown>
+        );
         const token = getAddress(tokenAddress);
         if (getAddress(token0) === token || getAddress(token1) === token) {
           return getAddress(pool);
         }
       } catch {
-        // Not a PoolCreated log for this ABI decode attempt.
+        // Not a pool/pair-creation log for this ABI decode attempt.
       }
     }
     return null;
@@ -1000,17 +1256,18 @@ export class TokenLaunchService {
   private async readPoolAddress(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     client: any,
+    adapter: DexAdapter,
     tokenAddress: Address
   ): Promise<Address | null> {
     for (const [tokenA, tokenB] of [
-      [AERODROME.weth, tokenAddress],
-      [tokenAddress, AERODROME.weth]
+      [adapter.weth, tokenAddress],
+      [tokenAddress, adapter.weth]
     ] as const) {
       const pool = (await client.readContract({
-        address: AERODROME.factory,
-        abi: aerodromeFactoryAbi,
-        functionName: 'getPool',
-        args: [tokenA, tokenB, false]
+        address: adapter.factory,
+        abi: adapter.factoryAbi,
+        functionName: adapter.getPoolFunctionName,
+        args: adapter.getPoolArgs(tokenA, tokenB)
       })) as Address;
       if (pool && getAddress(pool) !== zeroAddress) {
         return getAddress(pool);
@@ -1022,23 +1279,52 @@ export class TokenLaunchService {
   private async resolvePoolAddress(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     client: any,
+    adapter: DexAdapter,
     tokenAddress: Address,
     receipt?: TransactionReceipt
   ): Promise<Address> {
     if (receipt) {
-      const fromReceipt = this.poolFromReceipt(receipt, tokenAddress);
+      const fromReceipt = this.poolFromReceipt(adapter, receipt, tokenAddress);
       if (fromReceipt) return fromReceipt;
     }
 
     for (let attempt = 1; attempt <= 12; attempt += 1) {
-      const pool = await this.readPoolAddress(client, tokenAddress);
+      const pool = await this.readPoolAddress(client, adapter, tokenAddress);
       if (pool) return pool;
       await sleep(500);
     }
 
-    throw new Error('Aerodrome pool was not created');
+    throw new Error(`${adapter.label} pool was not created`);
   }
 
+  /**
+   * Read wallet 1's LP-token balance for a pool, returning null for any address that isn't a
+   * live contract on the CURRENT chain. Legacy jobs created on a previous chain (e.g. Base,
+   * before the switch to Robinhood) leave pool addresses with no code on the active RPC, and
+   * reading balanceOf there throws "returned no data (0x)". Skipping those keeps one stale
+   * address from breaking the whole stranded-LP scan or a remove-all. Genuine read errors on a
+   * real (code-bearing) pool still propagate.
+   */
+  private async readPoolLpBalance(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    client: any,
+    adapter: DexAdapter,
+    poolAddress: Address,
+    owner: Address
+  ): Promise<bigint | null> {
+    const code = (await withRpcRetry(`pool code for ${poolAddress}`, () =>
+      client.getBytecode({ address: poolAddress })
+    )) as string | undefined;
+    if (!code || code === '0x') return null;
+    return (await withRpcRetry(`LP balance for ${poolAddress}`, () =>
+      client.readContract({
+        address: poolAddress,
+        abi: adapter.poolAbi,
+        functionName: 'balanceOf',
+        args: [owner]
+      })
+    )) as bigint;
+  }
 
   async listUnremovedLp(): Promise<UnremovedLpPosition[]> {
     this.ensureClients();
@@ -1049,45 +1335,61 @@ export class TokenLaunchService {
 
     for (const [poolAddress, meta] of candidates) {
       await sleep(LP_SCAN_DELAY_MS);
-      const lpBalance = await withRpcRetry(`LP balance for ${poolAddress}`, () =>
-        publicClient.readContract({
-          address: poolAddress,
-          abi: aerodromePoolAbi,
-          functionName: 'balanceOf',
-          args: [wallet1Address]
-        })
-      ) as bigint;
-      if (lpBalance <= 0n) continue;
+      const adapter = getDexAdapter(meta.dex);
+      const lpBalance = await this.readPoolLpBalance(publicClient, adapter, poolAddress, wallet1Address);
+      if (lpBalance === null || lpBalance <= 0n) continue;
 
-      const tokenAddress = meta.tokenAddress ?? (await this.resolveTokenFromPool(publicClient, poolAddress));
+      const tokenAddress = meta.tokenAddress ?? (await this.resolveTokenFromPool(publicClient, adapter, poolAddress));
       positions.push({
         poolAddress,
         tokenAddress,
         lpBalance: lpBalance.toString(),
         jobIds: meta.jobIds,
         tokenName: meta.tokenName,
-        tokenSymbol: meta.tokenSymbol
+        tokenSymbol: meta.tokenSymbol,
+        dex: adapter.key
       });
     }
 
     return positions;
   }
 
+  /** Resolve one pool's LP position without scanning every historical pool (used for single-pool removal). */
+  private async resolveSinglePosition(poolAddress: Address): Promise<UnremovedLpPosition | null> {
+    const publicClient = this.publicClient!;
+    const wallet1Address = this.wallet1Address!;
+    const meta = this.collectPoolCandidates().get(poolAddress);
+    const adapter = getDexAdapter(meta?.dex);
+    const lpBalance = await this.readPoolLpBalance(publicClient, adapter, poolAddress, wallet1Address);
+    if (lpBalance === null || lpBalance <= 0n) return null;
+    const tokenAddress = meta?.tokenAddress ?? (await this.resolveTokenFromPool(publicClient, adapter, poolAddress));
+    return {
+      poolAddress,
+      tokenAddress,
+      lpBalance: lpBalance.toString(),
+      jobIds: meta?.jobIds ?? [],
+      tokenName: meta?.tokenName,
+      tokenSymbol: meta?.tokenSymbol,
+      dex: adapter.key
+    };
+  }
+
   async removeUnremovedLp(options: { poolAddress?: string; all?: boolean }): Promise<LpRemovalResult[]> {
     this.ensureClients();
 
-    const positions = await this.listUnremovedLp();
-    let targets = positions;
+    let targets: UnremovedLpPosition[];
     if (options.poolAddress) {
-      const wanted = getAddress(options.poolAddress);
-      targets = positions.filter((position) => getAddress(position.poolAddress) === wanted);
-      if (targets.length === 0) {
+      // Fast path: resolve just this pool instead of scanning every past pool first.
+      const position = await this.resolveSinglePosition(getAddress(options.poolAddress));
+      if (!position) {
         throw new Error('No LP balance found for that pool on wallet 1');
       }
-    } else if (!options.all) {
+      targets = [position];
+    } else if (options.all) {
+      targets = await this.listUnremovedLp();
+      if (targets.length === 0) return [];
+    } else {
       throw new Error('Provide poolAddress or set all=true');
-    } else if (targets.length === 0) {
-      return [];
     }
 
     const publicClient = this.publicClient!;
@@ -1099,9 +1401,11 @@ export class TokenLaunchService {
     for (const position of targets) {
       const poolAddress = getAddress(position.poolAddress);
       const tokenAddress = getAddress(position.tokenAddress);
+      const adapter = getDexAdapter(position.dex);
       try {
         const txHash = await this.removePoolLiquidity(
           publicClient,
+          adapter,
           wallet1,
           wallet1Account,
           wallet1Address,
@@ -1134,23 +1438,18 @@ export class TokenLaunchService {
     return results;
   }
 
-  private collectPoolCandidates(): Map<
-    Address,
-    { tokenAddress?: Address; jobIds: string[]; tokenName?: string; tokenSymbol?: string }
-  > {
-    const candidates = new Map<
-      Address,
-      { tokenAddress?: Address; jobIds: string[]; tokenName?: string; tokenSymbol?: string }
-    >();
+  private collectPoolCandidates(): Map<Address, PoolCandidateMeta> {
+    const candidates = new Map<Address, PoolCandidateMeta>();
 
     for (const job of this.repository.list()) {
       if (!job.poolAddress) continue;
       const poolAddress = getAddress(job.poolAddress);
-      const existing = candidates.get(poolAddress) ?? { jobIds: [] };
+      const existing = candidates.get(poolAddress) ?? { jobIds: [], dex: getDexAdapter(job.input.dex).key };
       existing.jobIds.push(job.jobId);
       if (job.tokenAddress) existing.tokenAddress = getAddress(job.tokenAddress);
       if (job.input.tokenName) existing.tokenName = job.input.tokenName;
       if (job.input.tokenSymbol) existing.tokenSymbol = job.input.tokenSymbol;
+      existing.dex = getDexAdapter(job.input.dex).key;
       candidates.set(poolAddress, existing);
     }
 
@@ -1160,19 +1459,20 @@ export class TokenLaunchService {
   private async resolveTokenFromPool(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     client: any,
+    adapter: DexAdapter,
     poolAddress: Address
   ): Promise<Address> {
     const token0 = (await client.readContract({
       address: poolAddress,
-      abi: aerodromePoolAbi,
+      abi: adapter.poolAbi,
       functionName: 'token0'
     })) as Address;
     const token1 = (await client.readContract({
       address: poolAddress,
-      abi: aerodromePoolAbi,
+      abi: adapter.poolAbi,
       functionName: 'token1'
     })) as Address;
-    const weth = getAddress(AERODROME.weth);
+    const weth = getAddress(adapter.weth);
     if (getAddress(token0) === weth) return getAddress(token1);
     if (getAddress(token1) === weth) return getAddress(token0);
     return getAddress(token0);
@@ -1181,30 +1481,30 @@ export class TokenLaunchService {
   private async removePoolLiquidity(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     publicClient: any,
+    adapter: DexAdapter,
     wallet1: WalletClient,
     wallet1Account: NonNullable<TokenLaunchService['wallet1Account']>,
     wallet1Address: Address,
     tokenAddress: Address,
     poolAddress: Address
   ): Promise<`0x${string}` | null> {
-    const lpBalance = (await withRpcRetry(`LP balance for ${poolAddress}`, () =>
-      publicClient.readContract({
-        address: poolAddress,
-        abi: aerodromePoolAbi,
-        functionName: 'balanceOf',
-        args: [wallet1Address]
-      })
-    )) as bigint;
-    if (lpBalance <= 0n) return null;
+    const lpBalance = await this.readPoolLpBalance(publicClient, adapter, poolAddress, wallet1Address);
+    if (lpBalance === null || lpBalance <= 0n) return null;
 
-    await this.claimPoolFees(publicClient, wallet1, wallet1Account, wallet1Address, poolAddress);
+    // Fee tokens cap max-wallet at ~2%, which makes the burn transfer to the router revert
+    // ("UniswapV2: TRANSFER_FAILED"). Lift the caps first (best-effort) so removal can proceed.
+    await this.tryLiftTokenLimits(publicClient, wallet1, wallet1Account, wallet1Address, tokenAddress);
+
+    if (adapter.supportsClaimFees) {
+      await this.claimPoolFees(publicClient, adapter, wallet1, wallet1Account, wallet1Address, poolAddress);
+    }
 
     const allowance = (await withRpcRetry(`LP allowance for ${poolAddress}`, () =>
       publicClient.readContract({
         address: poolAddress,
-        abi: aerodromePoolAbi,
+        abi: adapter.poolAbi,
         functionName: 'allowance',
-        args: [wallet1Address, AERODROME.router]
+        args: [wallet1Address, adapter.router]
       })
     )) as bigint;
 
@@ -1214,60 +1514,95 @@ export class TokenLaunchService {
         {
           account: wallet1Address,
           address: poolAddress,
-          abi: aerodromePoolAbi,
+          abi: adapter.poolAbi,
           functionName: 'approve',
-          args: [AERODROME.router, MAX_UINT256]
+          args: [adapter.router, MAX_UINT256]
         },
         80_000n
       );
-      const lpApproveHash = await wallet1.writeContract({
-        account: wallet1Account,
-        chain: BASE_CHAIN,
-        address: poolAddress,
-        abi: aerodromePoolAbi,
-        functionName: 'approve',
-        args: [AERODROME.router, MAX_UINT256],
-        gas: lpApproveGas
+      const lpApproveHash = await this.sendTx(wallet1Account, (nonce) =>
+        wallet1.writeContract({
+          account: wallet1Account,
+          chain: BASE_CHAIN,
+          address: poolAddress,
+          abi: adapter.poolAbi,
+          functionName: 'approve',
+          args: [adapter.router, MAX_UINT256],
+          gas: lpApproveGas,
+          nonce
+        })
+      );
+      const lpApproveReceipt = await publicClient.waitForTransactionReceipt({
+        hash: lpApproveHash,
+        timeout: REMOVE_RECEIPT_TIMEOUT_MS
       });
-      const lpApproveReceipt = await publicClient.waitForTransactionReceipt({ hash: lpApproveHash });
       if (lpApproveReceipt.status !== 'success') {
         throw new Error(
-          receiptFailureMessage('LP token approval for Aerodrome router failed', lpApproveReceipt, lpApproveHash)
+          receiptFailureMessage(`LP token approval for ${adapter.label} router failed`, lpApproveReceipt, lpApproveHash)
         );
       }
     }
 
-    const removeLiquidityGas = await this.estimateWriteGas(
-      publicClient,
-      {
-        account: wallet1Address,
-        address: AERODROME.router,
-        abi: aerodromeRouterAbi,
-        functionName: 'removeLiquidityETH',
-        args: [tokenAddress, false, lpBalance, 0n, 0n, wallet1Address, deadline()]
-      },
-      600_000n
-    );
-    const removeHash = await wallet1.writeContract({
-      account: wallet1Account,
-      chain: BASE_CHAIN,
-      address: AERODROME.router,
-      abi: aerodromeRouterAbi,
-      functionName: 'removeLiquidityETH',
-      args: [tokenAddress, false, lpBalance, 0n, 0n, wallet1Address, deadline()],
-      gas: removeLiquidityGas
+    const removeLiquidityArgs = adapter.removeLiquidityEthArgs({
+      token: tokenAddress,
+      liquidity: lpBalance,
+      amountTokenMin: 0n,
+      amountEthMin: 0n,
+      to: wallet1Address,
+      deadline: deadline()
     });
-    const removeReceipt = await publicClient.waitForTransactionReceipt({ hash: removeHash });
-    if (removeReceipt.status !== 'success') {
-      throw new Error(receiptFailureMessage('Remove liquidity transaction failed', removeReceipt, removeHash));
+    // Try plain removeLiquidityETH first; a fee-on-transfer token (like the AS fee token) makes
+    // it revert because the pair->router burn transfer is taxed, leaving the router short of the
+    // exact amount it forwards. Fall back to the SupportingFeeOnTransferTokens variant, which
+    // forwards the router's actual received balance. Skip a candidate that fails simulation while
+    // a fallback remains, so we don't broadcast a guaranteed-revert (gas-wasting) transaction.
+    const removeCandidates = ['removeLiquidityETH', adapter.removeLiquiditySupportingFunctionName];
+    let lastError: unknown;
+    for (let i = 0; i < removeCandidates.length; i += 1) {
+      const functionName = removeCandidates[i];
+      const isLast = i === removeCandidates.length - 1;
+      const request = {
+        account: wallet1Address,
+        address: adapter.router,
+        abi: adapter.routerAbi,
+        functionName,
+        args: removeLiquidityArgs
+      };
+      if (!isLast && !(await this.canSimulate(publicClient, request))) continue;
+      try {
+        const removeGas = await this.estimateWriteGas(publicClient, request, 600_000n);
+        const removeHash = await this.sendTx(wallet1Account, (nonce) =>
+          wallet1.writeContract({
+            account: wallet1Account,
+            chain: BASE_CHAIN,
+            address: adapter.router,
+            abi: adapter.routerAbi,
+            functionName,
+            args: removeLiquidityArgs,
+            gas: removeGas,
+            nonce
+          })
+        );
+        const removeReceipt = await publicClient.waitForTransactionReceipt({
+          hash: removeHash,
+          timeout: REMOVE_RECEIPT_TIMEOUT_MS
+        });
+        if (removeReceipt.status !== 'success') {
+          throw new Error(receiptFailureMessage(`${functionName} failed`, removeReceipt, removeHash));
+        }
+        return removeHash;
+      } catch (error) {
+        lastError = error;
+        if (isLast) break;
+      }
     }
-
-    return removeHash;
+    throw lastError instanceof Error ? lastError : new Error('Remove liquidity transaction failed');
   }
 
   private async claimPoolFees(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     publicClient: any,
+    adapter: DexAdapter,
     wallet1: WalletClient,
     wallet1Account: NonNullable<TokenLaunchService['wallet1Account']>,
     wallet1Address: Address,
@@ -1279,19 +1614,22 @@ export class TokenLaunchService {
         {
           account: wallet1Address,
           address: poolAddress,
-          abi: aerodromePoolAbi,
+          abi: adapter.poolAbi,
           functionName: 'claimFees'
         },
         120_000n
       );
-      const claimHash = await wallet1.writeContract({
-        account: wallet1Account,
-        chain: BASE_CHAIN,
-        address: poolAddress,
-        abi: aerodromePoolAbi,
-        functionName: 'claimFees',
-        gas: claimGas
-      });
+      const claimHash = await this.sendTx(wallet1Account, (nonce) =>
+        wallet1.writeContract({
+          account: wallet1Account,
+          chain: BASE_CHAIN,
+          address: poolAddress,
+          abi: adapter.poolAbi,
+          functionName: 'claimFees',
+          gas: claimGas,
+          nonce
+        })
+      );
       const claimReceipt = await publicClient.waitForTransactionReceipt({ hash: claimHash });
       if (claimReceipt.status !== 'success') {
         console.warn(
@@ -1300,7 +1638,7 @@ export class TokenLaunchService {
         return;
       }
 
-      await this.unwrapAllWeth(publicClient, wallet1, wallet1Account, wallet1Address);
+      await this.unwrapAllWeth(publicClient, adapter, wallet1, wallet1Account, wallet1Address);
     } catch (error) {
       console.warn(`LP fee claim failed for pool ${poolAddress}:`, formatViemError(error));
     }
@@ -1310,6 +1648,7 @@ export class TokenLaunchService {
   private async unwrapAllWeth(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     publicClient: any,
+    adapter: DexAdapter,
     wallet1: WalletClient,
     wallet1Account: NonNullable<TokenLaunchService['wallet1Account']>,
     wallet1Address: Address
@@ -1317,7 +1656,7 @@ export class TokenLaunchService {
     try {
       const wethBalance = (await withRpcRetry('WETH balance', () =>
         publicClient.readContract({
-          address: AERODROME.weth,
+          address: adapter.weth,
           abi: wethAbi,
           functionName: 'balanceOf',
           args: [wallet1Address]
@@ -1329,22 +1668,25 @@ export class TokenLaunchService {
         publicClient,
         {
           account: wallet1Address,
-          address: AERODROME.weth,
+          address: adapter.weth,
           abi: wethAbi,
           functionName: 'withdraw',
           args: [wethBalance]
         },
         50_000n
       );
-      const unwrapHash = await wallet1.writeContract({
-        account: wallet1Account,
-        chain: BASE_CHAIN,
-        address: AERODROME.weth,
-        abi: wethAbi,
-        functionName: 'withdraw',
-        args: [wethBalance],
-        gas: unwrapGas
-      });
+      const unwrapHash = await this.sendTx(wallet1Account, (nonce) =>
+        wallet1.writeContract({
+          account: wallet1Account,
+          chain: BASE_CHAIN,
+          address: adapter.weth,
+          abi: wethAbi,
+          functionName: 'withdraw',
+          args: [wethBalance],
+          gas: unwrapGas,
+          nonce
+        })
+      );
       const unwrapReceipt = await publicClient.waitForTransactionReceipt({ hash: unwrapHash });
       if (unwrapReceipt.status !== 'success') {
         console.warn(
@@ -1361,6 +1703,7 @@ export class TokenLaunchInputParser {
   static parse(body: unknown): TokenLaunchInput {
     const source = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
     const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+    const dex = TokenLaunchInputParser.parseDex(source.dex);
     const tokenName = str(source.tokenName) || 'AI';
     const tokenSymbol = str(source.tokenSymbol) || tokenName.slice(0, 8).toUpperCase() || 'AI';
     const lpEthAmount = str(source.lpEthAmount) || DEFAULT_LP_ETH;
@@ -1386,6 +1729,7 @@ export class TokenLaunchInputParser {
     }
 
     return {
+      dex,
       tokenName,
       tokenSymbol,
       lpEthAmount,
@@ -1398,6 +1742,15 @@ export class TokenLaunchInputParser {
       removeLpTimeMinutes,
       minBuyersBeforeRemoveLp
     };
+  }
+
+  private static parseDex(value: unknown): DexKey {
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      const match = DEX_ADAPTERS.find((adapter) => adapter.key === normalized);
+      if (match) return match.key;
+    }
+    return DEFAULT_DEX;
   }
 
   private static parseUseWallet3(value: unknown): boolean {

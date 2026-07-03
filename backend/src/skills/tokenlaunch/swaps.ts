@@ -2,12 +2,14 @@ import { decodeEventLog, formatEther, getAddress, type Address } from 'viem';
 import type { LaunchTradeStats, PoolTrade } from '../../types';
 
 export type { LaunchTradeStats };
-import { AERODROME, aerodromePoolAbi } from './config';
+import { MIN_DETECTION_BUY_WEI } from './config';
+import { ALL_DEX_ROUTERS, type DexAdapter } from './dex';
 
 const LOG_CHUNK_BLOCKS = 2_000n;
 const CHUNK_DELAY_MS = 400;
 
-const PROTOCOL_ADDRESSES = new Set<string>([AERODROME.router.toLowerCase()]);
+// Exclude every supported DEX router from buyer detection regardless of which pool we scan.
+const PROTOCOL_ADDRESSES = new Set<string>(ALL_DEX_ROUTERS);
 
 export function tradeKey(trade: PoolTrade): string {
   return `${trade.txHash}:${trade.logIndex}`;
@@ -31,6 +33,12 @@ function isExternalTrader(trade: PoolTrade): boolean {
   );
 }
 
+/** External buy whose ETH value meets the detection minimum (dust buys excluded). */
+function isQualifyingBuyer(trade: PoolTrade): boolean {
+  return isExternalTrader(trade) && BigInt(trade.ethAmount) >= MIN_DETECTION_BUY_WEI;
+}
+
+/** Unique external buyers seen, including sub-threshold dust buys (display/"seen" count). */
 export function countExternalBuyersFromTrades(trades: PoolTrade[]): number {
   const buyers = new Set<string>();
   for (const trade of trades) {
@@ -41,8 +49,20 @@ export function countExternalBuyersFromTrades(trades: PoolTrade[]): number {
   return buyers.size;
 }
 
+/** Unique external buyers meeting the detection minimum — drives LP-removal triggers. */
+export function countQualifyingBuyersFromTrades(trades: PoolTrade[]): number {
+  const buyers = new Set<string>();
+  for (const trade of trades) {
+    if (isQualifyingBuyer(trade)) {
+      buyers.add(trade.trader.toLowerCase());
+    }
+  }
+  return buyers.size;
+}
+
 export function computeTradeStats(trades: PoolTrade[]): LaunchTradeStats {
   const externalBuyers = new Set<string>();
+  const qualifyingBuyers = new Set<string>();
   const externalSellers = new Set<string>();
   let buys = 0;
   let sells = 0;
@@ -52,8 +72,10 @@ export function computeTradeStats(trades: PoolTrade[]): LaunchTradeStats {
     if (trade.side === 'buy') buys += 1;
     else sells += 1;
     if (trade.isOwnWallet) ownWalletSwaps += 1;
-    else if (isExternalTrader(trade)) externalBuyers.add(trade.trader.toLowerCase());
-    else if (
+    else if (isExternalTrader(trade)) {
+      externalBuyers.add(trade.trader.toLowerCase());
+      if (isQualifyingBuyer(trade)) qualifyingBuyers.add(trade.trader.toLowerCase());
+    } else if (
       trade.side === 'sell' &&
       !PROTOCOL_ADDRESSES.has(trade.trader.toLowerCase())
     ) {
@@ -66,6 +88,7 @@ export function computeTradeStats(trades: PoolTrade[]): LaunchTradeStats {
     buys,
     sells,
     externalBuyers: externalBuyers.size,
+    qualifyingBuyers: qualifyingBuyers.size,
     externalSellers: externalSellers.size,
     ownWalletSwaps
   };
@@ -110,19 +133,20 @@ type RawSwapLog = {
 };
 
 function decodeSwapLog(
+  adapter: DexAdapter,
   log: RawSwapLog,
   tokenIs0: boolean,
   ourWallets: Set<string>,
   blockTimestamps: Map<number, string>
 ): PoolTrade | null {
   const decoded = decodeEventLog({
-    abi: aerodromePoolAbi,
+    abi: adapter.poolAbi,
     data: log.data,
     topics: log.topics
   });
   if (decoded.eventName !== 'Swap') return null;
 
-  const { sender, to, amount0In, amount1In, amount0Out, amount1Out } = decoded.args as {
+  const { sender, to, amount0In, amount1In, amount0Out, amount1Out } = decoded.args as unknown as {
     sender: Address;
     to: Address;
     amount0In: bigint;
@@ -170,7 +194,8 @@ function decodeSwapLog(
     ethAmount: ethAmount.toString(),
     ethAmountFormatted: formatEther(ethAmount),
     tokenAmountFormatted: formatEther(tokenAmount),
-    isOwnWallet
+    isOwnWallet,
+    belowDetectionThreshold: ethAmount < MIN_DETECTION_BUY_WEI
   };
 }
 
@@ -184,6 +209,7 @@ type PublicClientLike = {
 
 export async function fetchPoolTrades(
   client: PublicClientLike,
+  adapter: DexAdapter,
   poolAddress: Address,
   tokenAddress: Address,
   fromBlock: bigint,
@@ -192,7 +218,7 @@ export async function fetchPoolTrades(
 ): Promise<PoolTrade[]> {
   const token0 = (await client.readContract({
     address: poolAddress,
-    abi: aerodromePoolAbi,
+    abi: adapter.poolAbi,
     functionName: 'token0'
   })) as Address;
   const tokenIs0 = getAddress(token0) === getAddress(tokenAddress);
@@ -206,7 +232,7 @@ export async function fetchPoolTrades(
       chunkStart + LOG_CHUNK_BLOCKS > latest ? latest : chunkStart + LOG_CHUNK_BLOCKS;
     const logs = (await client.getLogs({
       address: poolAddress,
-      event: aerodromePoolAbi[0],
+      event: adapter.swapEvent,
       fromBlock: chunkStart,
       toBlock: chunkEnd
     })) as RawSwapLog[];
@@ -223,7 +249,7 @@ export async function fetchPoolTrades(
 
   const trades: PoolTrade[] = [];
   for (const log of allLogs) {
-    const trade = decodeSwapLog(log, tokenIs0, ourWallets, blockTimestamps);
+    const trade = decodeSwapLog(adapter, log, tokenIs0, ourWallets, blockTimestamps);
     if (trade) trades.push(trade);
   }
 

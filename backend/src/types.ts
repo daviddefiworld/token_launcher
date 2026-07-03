@@ -68,7 +68,15 @@ export type TokenLaunchStatus =
   | 'completed'
   | 'failed';
 
+/** DEX to launch on. Both are constant-product AMMs on Base. */
+export type DexKey = 'aerodrome' | 'uniswap';
+
 export interface TokenLaunchInput {
+  /**
+   * DEX to deploy LP on. New launches default to 'uniswap' (set by the parser).
+   * Absent on legacy jobs, which are treated as 'aerodrome' at runtime.
+   */
+  dex?: DexKey;
   tokenName: string;
   tokenSymbol: string;
   lpEthAmount: string;
@@ -103,13 +111,18 @@ export interface PoolTrade {
   tokenAmountFormatted: string;
   ethAmountFormatted: string;
   isOwnWallet: boolean;
+  /** ETH value is below MIN_DETECTION_BUY_ETH — shown/counted but ignored for buyer detection. */
+  belowDetectionThreshold?: boolean;
 }
 
 export interface LaunchTradeStats {
   totalSwaps: number;
   buys: number;
   sells: number;
+  /** Unique external buyers seen (includes sub-threshold dust buys). */
   externalBuyers: number;
+  /** Unique external buyers whose buy met MIN_DETECTION_BUY_ETH — drives detection. */
+  qualifyingBuyers: number;
   externalSellers: number;
   ownWalletSwaps: number;
 }
@@ -164,6 +177,7 @@ export interface UnremovedLpPosition {
   jobIds: string[];
   tokenName?: string;
   tokenSymbol?: string;
+  dex?: DexKey;
 }
 
 export interface LpRemovalResult {

@@ -65,7 +65,10 @@ export type TokenLaunchStatus =
   | 'completed'
   | 'failed';
 
+export type DexKey = 'aerodrome' | 'uniswap';
+
 export interface TokenLaunchInput {
+  dex: DexKey;
   tokenName: string;
   tokenSymbol: string;
   lpEthAmount: string;
@@ -93,13 +96,18 @@ export interface PoolTrade {
   tokenAmountFormatted: string;
   ethAmountFormatted: string;
   isOwnWallet: boolean;
+  /** ETH value below the detection minimum — shown but ignored for buyer detection. */
+  belowDetectionThreshold?: boolean;
 }
 
 export interface LaunchTradeStats {
   totalSwaps: number;
   buys: number;
   sells: number;
+  /** Unique external buyers seen (includes sub-threshold dust buys). */
   externalBuyers: number;
+  /** Unique external buyers meeting the detection minimum — drives detection. */
+  qualifyingBuyers: number;
   externalSellers: number;
   ownWalletSwaps: number;
 }
@@ -154,6 +162,7 @@ export interface UnremovedLpPosition {
   jobIds: string[];
   tokenName?: string;
   tokenSymbol?: string;
+  dex?: DexKey;
 }
 
 export interface LpRemovalResult {
