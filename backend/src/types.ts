@@ -188,6 +188,73 @@ export interface LpRemovalResult {
   error?: string;
 }
 
+/**
+ * Contract used by a manual (deploy-only) token deploy.
+ * 'normal' = plain ERC-20 (LaunchToken.sol, constructor takes name/symbol/supply).
+ * 'tax' = fee-on-transfer token — name/symbol/supply/taxes are hardcoded in the compiled contract.
+ */
+export type TokenDeployType = 'normal' | 'tax';
+
+export interface ManualTokenDeployInput {
+  tokenType: TokenDeployType;
+  /** Required for 'normal'; ignored for 'tax' (contract-defined). */
+  tokenName?: string;
+  tokenSymbol?: string;
+  /** Human units, scaled by 18 decimals ('normal' only). */
+  totalSupply?: string;
+}
+
+/** A token deployed from the manual launch page (deploy only — no LP, no monitoring). */
+export interface DeployedTokenRecord {
+  id: string;
+  tokenType: TokenDeployType;
+  tokenAddress: string;
+  tokenName?: string;
+  tokenSymbol?: string;
+  totalSupply?: string;
+  deployTxHash: string;
+  deployerAddress: string;
+  createdAt: string;
+}
+
+/** An LP position created from the manual liquidity page, saved so it can be removed later. */
+export interface ManualLpRecord {
+  poolAddress: string;
+  tokenAddress: string;
+  tokenSymbol?: string;
+  tokenDecimals?: number;
+  dex: DexKey;
+  addTxHash?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LpPosition extends ManualLpRecord {
+  /** Wallet 1's raw LP-token balance for the pool. */
+  lpBalance: string;
+  /** Wallet 1's share of the pool reserves, in human units. Absent when reserves can't be read. */
+  pooledToken?: string;
+  pooledEth?: string;
+}
+
+export interface AddLiquidityInput {
+  tokenAddress: string;
+  /** Token amount in human units — scaled by the token's own `decimals()`. */
+  tokenAmount: string;
+  ethAmount: string;
+}
+
+export interface AddLiquidityResult {
+  position: LpPosition;
+  approveTxHash?: string;
+  addTxHash: string;
+}
+
+export interface RemoveLiquidityInput {
+  poolAddress?: string;
+  tokenAddress?: string;
+}
+
 export interface WithdrawRequest {
   text: string;
   currency: string;

@@ -6,14 +6,17 @@ import { createServer, Server as HttpServer } from 'http';
 import { Server, Socket } from 'socket.io';
 import { GmailService } from './gmail';
 import { networkTime } from './networkTime';
-import { GmailRepository, OrderRepository, TokenLaunchRepository, VerificationRepository, WorkflowRepository, nowIso } from './persist';
-import { TokenLaunchInputParser, TokenLaunchService } from './skills/tokenlaunch';
+import { isAddress } from 'viem';
+import { GmailRepository, ManualDeployRepository, ManualLpRepository, OrderRepository, TokenLaunchRepository, VerificationRepository, WorkflowRepository, nowIso } from './persist';
+import { ManualDeployInputParser, TokenLaunchInputParser, TokenLaunchService } from './skills/tokenlaunch';
 import { LaunchWorkflowInputParser, LaunchWorkflowService } from './workflow';
 import type {
   ActivityItem,
+  AddLiquidityInput,
   AutomationOrder,
   ExtensionRecord,
   LaunchWorkflow,
+  RemoveLiquidityInput,
   TokenLaunchJob,
   VerificationCodeRequest,
   WithdrawRequest
@@ -200,16 +203,59 @@ class WithdrawInputParser {
   }
 }
 
+class LiquidityInputParser {
+  private static address(value: unknown, field: string): string {
+    const text = typeof value === 'string' ? value.trim() : '';
+    if (!text) throw new Error(`${field} is required`);
+    if (!isAddress(text)) throw new Error(`${field} is not a valid address: ${text}`);
+    return text;
+  }
+
+  private static amount(value: unknown, field: string): string {
+    const text = typeof value === 'string' ? value.trim() : typeof value === 'number' ? String(value) : '';
+    if (!text) throw new Error(`${field} is required`);
+    if (!Number.isFinite(Number(text)) || Number(text) <= 0) {
+      throw new Error(`${field} must be a number greater than 0`);
+    }
+    return text;
+  }
+
+  static parseAdd(body: unknown): AddLiquidityInput {
+    const source = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+    return {
+      tokenAddress: LiquidityInputParser.address(source.tokenAddress, 'tokenAddress'),
+      tokenAmount: LiquidityInputParser.amount(source.tokenAmount, 'tokenAmount'),
+      ethAmount: LiquidityInputParser.amount(source.ethAmount, 'ethAmount')
+    };
+  }
+
+  static parseRemove(body: unknown): RemoveLiquidityInput {
+    const source = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+    if (source.poolAddress) {
+      return { poolAddress: LiquidityInputParser.address(source.poolAddress, 'poolAddress') };
+    }
+    if (source.tokenAddress) {
+      return { tokenAddress: LiquidityInputParser.address(source.tokenAddress, 'tokenAddress') };
+    }
+    throw new Error('Provide a pool address or a token address');
+  }
+}
+
 export class TokenAutomationApp {
   private readonly orders = new OrderRepository();
   private readonly tokenLaunches = new TokenLaunchRepository();
+  private readonly manualLp = new ManualLpRepository();
+  private readonly manualDeploys = new ManualDeployRepository();
   private readonly workflows = new WorkflowRepository();
   private readonly gmailStore = new GmailRepository();
   private readonly verificationStore = new VerificationRepository();
   private readonly gmail = new GmailService(this.gmailStore);
   private readonly activity = new ActivityFeed(this.verificationStore, this.tokenLaunches, this.workflows);
-  private readonly tokenLaunch = new TokenLaunchService(this.tokenLaunches, (job, event) =>
-    this.io.to('dashboards').emit(`tokenlaunch:${event}`, { job })
+  private readonly tokenLaunch = new TokenLaunchService(
+    this.tokenLaunches,
+    (job, event) => this.io.to('dashboards').emit(`tokenlaunch:${event}`, { job }),
+    this.manualLp,
+    this.manualDeploys
   );
   private readonly launchWorkflow = new LaunchWorkflowService(
     this.workflows,
@@ -237,6 +283,8 @@ export class TokenAutomationApp {
     app.use('/api/gmails', this.gmailRoutes());
     app.use('/api/verification-requests', this.verificationRoutes());
     app.use('/api/tokenlaunch', this.tokenLaunchRoutes());
+    app.use('/api/deploy', this.deployRoutes());
+    app.use('/api/liquidity', this.liquidityRoutes());
     app.use('/api/workflows', this.workflowRoutes());
     this.coreRoutes(app);
 
@@ -439,6 +487,87 @@ export class TokenAutomationApp {
         const message = error instanceof Error ? error.message : 'Invalid token launch request';
         const status = message.includes('already running') ? 409 : message.includes('must be set') ? 503 : 400;
         res.status(status).json({ success: false, error: message });
+      }
+    });
+
+    return router;
+  }
+
+  /** Manual token deploy from the dashboard "Manual Launch" page — deploy only, no LP. */
+  private deployRoutes(): Router {
+    const router = Router();
+
+    router.get('/', (_req, res) => {
+      res.json({ success: true, data: this.tokenLaunch.listDeployedTokens() });
+    });
+
+    router.post('/', async (req, res) => {
+      try {
+        const data = await this.tokenLaunch.deployManualToken(ManualDeployInputParser.parse(req.body));
+        res.status(201).json({ success: true, data });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Token deploy failed';
+        const status = message.includes('must be configured') ? 503 : 400;
+        res.status(status).json({ success: false, error: message });
+      }
+    });
+
+    return router;
+  }
+
+  /**
+   * Manual add/remove liquidity from the dashboard. Every failure returns the underlying reason
+   * (revert string, insufficient balance, missing pool) so the page can show it verbatim.
+   */
+  private liquidityRoutes(): Router {
+    const router = Router();
+
+    const fail = (res: Response, error: unknown, fallback: string) => {
+      const message = error instanceof Error ? error.message : fallback;
+      const status = message.includes('must be configured')
+        ? 503
+        : message.includes('No contract') || message.includes('No Uniswap') || message.includes('holds no LP')
+          ? 404
+          : 400;
+      res.status(status).json({ success: false, error: message });
+    };
+
+    router.get('/', async (_req, res) => {
+      try {
+        res.json({ success: true, data: await this.tokenLaunch.listSavedLp() });
+      } catch (error) {
+        fail(res, error, 'Failed to list LP positions');
+      }
+    });
+
+    router.get('/lookup', async (req, res) => {
+      try {
+        const tokenAddress = typeof req.query.tokenAddress === 'string' ? req.query.tokenAddress.trim() : '';
+        if (!isAddress(tokenAddress)) {
+          res.status(400).json({ success: false, error: `tokenAddress is not a valid address: ${tokenAddress}` });
+          return;
+        }
+        res.json({ success: true, data: await this.tokenLaunch.findLpByToken(tokenAddress) });
+      } catch (error) {
+        fail(res, error, 'Failed to look up LP position');
+      }
+    });
+
+    router.post('/add', async (req, res) => {
+      try {
+        const data = await this.tokenLaunch.addLiquidity(LiquidityInputParser.parseAdd(req.body));
+        res.status(201).json({ success: true, data });
+      } catch (error) {
+        fail(res, error, 'Failed to add liquidity');
+      }
+    });
+
+    router.post('/remove', async (req, res) => {
+      try {
+        const data = await this.tokenLaunch.removeLiquidity(LiquidityInputParser.parseRemove(req.body));
+        res.json({ success: true, data });
+      } catch (error) {
+        fail(res, error, 'Failed to remove liquidity');
       }
     });
 

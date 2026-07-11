@@ -62,6 +62,10 @@ function toNum(value: string | number | undefined): number {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
+type AutoTab = 'launch' | 'lp' | 'history';
+
+const AUTO_TABS: AutoTab[] = ['launch', 'lp', 'history'];
+
 const MANUAL_BUY_STATUSES: TokenLaunchStatus[] = ['monitoring', 'buying'];
 
 const ACTIVE_LAUNCH_STATUSES: TokenLaunchStatus[] = [
@@ -184,6 +188,7 @@ export function TokenLaunchPage({
   const [finishBusy, setFinishBusy] = useState<string | null>(null);
   const [finishError, setFinishError] = useState<string | null>(null);
   const [historyPage, setHistoryPage] = useState(1);
+  const [tab, setTab] = useState<AutoTab>('launch');
 
   const hasActiveJob = jobs.some((job) => isActiveStatus(job.status));
 
@@ -363,6 +368,7 @@ export function TokenLaunchPage({
       const repeatLabel =
         input.repeatCount > 1 ? `${input.repeatCount} launches queued sequentially.` : 'Launch started.';
       setNotice(`${repeatLabel} Token "${input.tokenName}".`);
+      setTab('history');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start token launch');
     } finally {
@@ -402,6 +408,12 @@ export function TokenLaunchPage({
     }
   ];
 
+  const tabLabel = (key: AutoTab): string => {
+    if (key === 'launch') return 'New launch';
+    if (key === 'lp') return unremovedLp.length > 0 ? `Stranded LP (${unremovedLp.length})` : 'Stranded LP';
+    return jobs.length > 0 ? `Launches (${jobs.length})` : 'Launches';
+  };
+
   const submitLabel = busy
     ? 'Starting…'
     : hasActiveJob
@@ -417,8 +429,22 @@ export function TokenLaunchPage({
       <div className="tl-main">
         <header className="tl-head">
           <div>
-            <p className="eyebrow">Base · {dexLabel(input.dex)}</p>
-            <h1>Token Launch</h1>
+            <p className="eyebrow">Robinhood · {dexLabel(input.dex)}</p>
+            <h1>Auto Launch</h1>
+          </div>
+          <div className="tl-dex-toggle" role="tablist" aria-label="Auto launch section">
+            {AUTO_TABS.map((key) => (
+              <button
+                key={key}
+                type="button"
+                role="tab"
+                aria-selected={tab === key}
+                className={`tl-dex-option${tab === key ? ' active' : ''}`}
+                onClick={() => setTab(key)}
+              >
+                {tabLabel(key)}
+              </button>
+            ))}
           </div>
         </header>
 
@@ -432,6 +458,7 @@ export function TokenLaunchPage({
           </section>
         )}
 
+      {tab === 'launch' && (
       <section className="detail-panel tl-form-card">
         <div className="tl-section-head">
           <h2 className="section-title" style={{ marginBottom: 0 }}>
@@ -648,7 +675,9 @@ export function TokenLaunchPage({
         {notice && <p className="result">{notice}</p>}
         {error && <p className="error">{error}</p>}
       </section>
+      )}
 
+      {tab === 'lp' && (
       <section className="detail-panel">
         <div className="card-title-row">
           <h2 className="section-title">Stranded LP</h2>
@@ -718,7 +747,10 @@ export function TokenLaunchPage({
         {lpNotice && <p className="result">{lpNotice}</p>}
         {lpError && <p className="error">{lpError}</p>}
       </section>
+      )}
 
+      {tab === 'history' && (
+      <>
       {(manualBuyError || finishError) && (
         <p className="error page-banner-error" style={{ marginBottom: 12 }}>
           {manualBuyError || finishError}
@@ -886,6 +918,8 @@ export function TokenLaunchPage({
           </div>
         )}
       </section>
+      </>
+      )}
       </div>
 
       <aside className="tl-sidebar">

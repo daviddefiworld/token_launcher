@@ -3,9 +3,13 @@ import {
   createWalletClient,
   decodeEventLog,
   encodeDeployData,
+  erc20Abi,
+  formatEther,
+  formatUnits,
   getAddress,
   http,
   parseEther,
+  parseUnits,
   zeroAddress,
   type Address,
   type TransactionReceipt,
@@ -13,6 +17,14 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type {
+  AddLiquidityInput,
+  AddLiquidityResult,
+  DeployedTokenRecord,
+  LpPosition,
+  ManualLpRecord,
+  ManualTokenDeployInput,
+  RemoveLiquidityInput,
+  TokenDeployType,
   TokenLaunchInput,
   TokenLaunchJob,
   LpRemovalResult,
@@ -27,7 +39,8 @@ import {
   mergeTrades,
   resolveFromBlock
 } from './swaps';
-import { TokenLaunchRepository, nowIso } from '../../persist';
+import { ManualDeployRepository, ManualLpRepository, TokenLaunchRepository, nowIso } from '../../persist';
+import { describeError, probeTokenTransferRevert } from './errors';
 import {
   BASE_CHAIN,
   DEFAULT_BUY_ETH,
@@ -42,7 +55,7 @@ import {
   wethAbi
 } from './config';
 import { DEFAULT_DEX, DEX_ADAPTERS, getDexAdapter, type DexAdapter, type DexKey } from './dex';
-import { feeTokenAbi, feeTokenBytecode } from './contracts';
+import { feeTokenAbi, feeTokenBytecode, launchTokenAbi, launchTokenBytecode } from './contracts';
 
 export type TokenLaunchBroadcast = (job: TokenLaunchJob, event: 'created' | 'updated') => void;
 
@@ -210,7 +223,9 @@ export class TokenLaunchService {
 
   constructor(
     private readonly repository: TokenLaunchRepository,
-    private readonly broadcast?: TokenLaunchBroadcast
+    private readonly broadcast?: TokenLaunchBroadcast,
+    private readonly lpRepository: ManualLpRepository = new ManualLpRepository(),
+    private readonly deployRepository: ManualDeployRepository = new ManualDeployRepository()
   ) {
     setTimeout(() => {
       void this.backfillAllTrades({ onlyMissing: true }).catch((error) => {
@@ -755,9 +770,35 @@ export class TokenLaunchService {
   }
 
   /**
-   * Call the fee token's owner-only `isNotRestricted()` to set max tx / max wallet to the full
-   * supply, removing the 2% caps that would otherwise revert real and own-wallet buys. Sent from
-   * wallet 1 (the deployer/owner).
+   * True if the token still has `limitsEnabled` set. While it is, `_transfer` reverts for any
+   * transfer between two non-exempt, non-owner addresses ("_transfer:: Trading is not active.",
+   * since `tradingEnabled` starts false and can never be set — see feeTokenAbi). That blocks both
+   * external buys and the pair->router burn leg of an LP removal.
+   *
+   * Returns false for a token without `readLimitsInfo()` (i.e. the plain LaunchToken), which has
+   * no limits to lift.
+   */
+  private async tokenLimitsActive(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    publicClient: any,
+    tokenAddress: Address
+  ): Promise<boolean> {
+    try {
+      const [limitsEnabled] = (await publicClient.readContract({
+        address: tokenAddress,
+        abi: feeTokenAbi,
+        functionName: 'readLimitsInfo'
+      })) as [boolean, bigint, bigint];
+      return limitsEnabled;
+    } catch {
+      return false; // no such accessor — not the fee token, nothing to lift
+    }
+  }
+
+  /**
+   * Call the fee token's owner-only `removeLimitsNow()` to clear `limitsEnabled`, which unblocks
+   * transfers for non-exempt addresses — required for buys AND for LP removal. Sent from wallet 1
+   * (the deployer/owner). Throws on failure: nothing downstream works while limits are on.
    */
   private async removeTokenLimits(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -767,38 +808,66 @@ export class TokenLaunchService {
     wallet1Address: Address,
     tokenAddress: Address
   ): Promise<void> {
-    const gas = await this.estimateWriteGas(
-      publicClient,
-      {
-        account: wallet1Address,
-        address: tokenAddress,
-        abi: feeTokenAbi,
-        functionName: 'isNotRestricted'
-      },
-      80_000n
-    );
+    if (!(await this.tokenLimitsActive(publicClient, tokenAddress))) return;
+
+    const request = {
+      account: wallet1Address,
+      address: tokenAddress,
+      abi: feeTokenAbi,
+      functionName: 'removeLimitsNow'
+    } as const;
+
+    const gas = await this.estimateWriteGas(publicClient, request, 80_000n);
     const hash = await this.sendTx(wallet1Account, (nonce) =>
-      wallet1.writeContract({
-        account: wallet1Account,
-        chain: BASE_CHAIN,
-        address: tokenAddress,
-        abi: feeTokenAbi,
-        functionName: 'isNotRestricted',
-        gas,
-        nonce
-      })
+      wallet1.writeContract({ ...request, account: wallet1Account, chain: BASE_CHAIN, gas, nonce })
     );
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
     if (receipt.status !== 'success') {
-      throw new Error(receiptFailureMessage('Remove token limits (isNotRestricted) failed', receipt, hash));
+      throw new Error(receiptFailureMessage('Remove token limits (removeLimitsNow) failed', receipt, hash));
     }
   }
 
   /**
-   * Best-effort: lift a fee token's max-wallet/tx caps before an LP removal. With limits active,
-   * the pair->router burn transfer exceeds max-wallet and the removal reverts with
-   * "UniswapV2: TRANSFER_FAILED". Guarded so it only sends a tx when the token actually has active
-   * limits and wallet 1 can lift them (owner) — a no-op for already-lifted or non-fee tokens.
+   * Lift the fee token's limits before an LP removal. While `limitsEnabled` is set, the pair->router
+   * burn transfer reverts ("_transfer:: Trading is not active.") and the router reports the useless
+   * "UniswapV2: TRANSFER_FAILED" — so this is a hard precondition for removal, not a nicety.
+   *
+   * A no-op when the token has no limits (plain LaunchToken) or they are already lifted. If wallet 1
+   * cannot lift them (not the owner), it throws rather than proceeding into a guaranteed revert.
+   */
+  private async liftTokenLimitsForRemoval(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    publicClient: any,
+    wallet1: WalletClient,
+    wallet1Account: NonNullable<TokenLaunchService['wallet1Account']>,
+    wallet1Address: Address,
+    tokenAddress: Address
+  ): Promise<void> {
+    if (!(await this.tokenLimitsActive(publicClient, tokenAddress))) return;
+
+    try {
+      await this.removeTokenLimits(publicClient, wallet1, wallet1Account, wallet1Address, tokenAddress);
+    } catch (error) {
+      throw new Error(
+        `Token ${tokenAddress} still has transfer limits enabled and they could not be lifted ` +
+          `(removeLimitsNow is owner-only — wallet 1 must be the token owner). ` +
+          `LP removal cannot succeed until they are: ${describeError(error)}`
+      );
+    }
+
+    if (await this.tokenLimitsActive(publicClient, tokenAddress)) {
+      throw new Error(
+        `Token ${tokenAddress} still reports limitsEnabled after removeLimitsNow(); LP removal would ` +
+          `revert with "UniswapV2: TRANSFER_FAILED" (underlying: "_transfer:: Trading is not active.")`
+      );
+    }
+  }
+
+  /**
+   * Best-effort limit lift for the manual add-liquidity path, where the token may be one wallet 1
+   * does not own (so `removeLimitsNow()` is not callable). Adding liquidity itself still works —
+   * the owner/deployer is exempt — so a failure here is a warning, not a hard stop. Removal has its
+   * own strict check.
    */
   private async tryLiftTokenLimits(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -809,39 +878,9 @@ export class TokenLaunchService {
     tokenAddress: Address
   ): Promise<void> {
     try {
-      const [maxWallet, supply] = (await Promise.all([
-        publicClient.readContract({ address: tokenAddress, abi: feeTokenAbi, functionName: '_maxWalletSize' }),
-        publicClient.readContract({ address: tokenAddress, abi: feeTokenAbi, functionName: 'totalSupply' })
-      ])) as [bigint, bigint];
-      if (maxWallet >= supply) return; // already unrestricted
-    } catch {
-      return; // token lacks these accessors (not the fee token) — nothing to lift
-    }
-
-    const request = {
-      account: wallet1Address,
-      address: tokenAddress,
-      abi: feeTokenAbi,
-      functionName: 'isNotRestricted'
-    };
-    if (!(await this.canSimulate(publicClient, request))) return; // e.g. wallet 1 is not the owner
-
-    try {
-      const gas = await this.estimateWriteGas(publicClient, request, 80_000n);
-      const hash = await this.sendTx(wallet1Account, (nonce) =>
-        wallet1.writeContract({
-          account: wallet1Account,
-          chain: BASE_CHAIN,
-          address: tokenAddress,
-          abi: feeTokenAbi,
-          functionName: 'isNotRestricted',
-          gas,
-          nonce
-        })
-      );
-      await publicClient.waitForTransactionReceipt({ hash, timeout: REMOVE_RECEIPT_TIMEOUT_MS });
+      await this.removeTokenLimits(publicClient, wallet1, wallet1Account, wallet1Address, tokenAddress);
     } catch (error) {
-      console.warn(`Lift token limits before removal failed for ${tokenAddress}:`, formatViemError(error));
+      console.warn(`Lift token limits failed for ${tokenAddress}:`, describeError(error));
     }
   }
 
@@ -915,20 +954,6 @@ export class TokenLaunchService {
       }
     }
     return floor;
-  }
-
-  /** True if the contract write would succeed against current state (gas estimation doesn't revert). */
-  private async canSimulate(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    publicClient: any,
-    request: Parameters<typeof publicClient.estimateContractGas>[0]
-  ): Promise<boolean> {
-    try {
-      await publicClient.estimateContractGas(request);
-      return true;
-    } catch {
-      return false;
-    }
   }
 
   private async run(jobId: string): Promise<void> {
@@ -1062,8 +1087,9 @@ export class TokenLaunchService {
         throw new Error(receiptFailureMessage('Add liquidity transaction failed', addLiquidityReceipt, addLiquidityHash));
       }
 
-      // Lift the fee token's 2% max-tx / max-wallet caps (owner-only). Without this, any
-      // non-trivial buy reverts with "Exceeds the _maxTxAmount." since all supply is in the LP.
+      // Unlock the fee token (owner-only removeLimitsNow). It deploys with limitsEnabled=true and
+      // tradingEnabled=false, so until this lands EVERY non-exempt transfer reverts with
+      // "_transfer:: Trading is not active." — no external buyer can buy, and LP removal reverts.
       await this.removeTokenLimits(publicClient, wallet1, wallet1Account, wallet1Address, tokenAddress);
 
       const poolAddress = await this.resolvePoolAddress(publicClient, adapter, tokenAddress, addLiquidityReceipt);
@@ -1438,6 +1464,429 @@ export class TokenLaunchService {
     return results;
   }
 
+  // ---------------------------------------------------------------------------------------
+  // Manual token deploy (dashboard "Manual Launch" page). Deploys the contract from wallet 1
+  // and stops there — no LP, no monitoring. Uses the shared nonce queue, so it is safe while
+  // an auto launch is mid-flight.
+  // ---------------------------------------------------------------------------------------
+
+  listDeployedTokens(): DeployedTokenRecord[] {
+    return this.deployRepository.list();
+  }
+
+  async deployManualToken(input: ManualTokenDeployInput): Promise<DeployedTokenRecord> {
+    this.ensureClients();
+    const publicClient = this.publicClient!;
+    const wallet1 = this.wallet1!;
+    const wallet1Account = this.wallet1Account!;
+    const wallet1Address = this.wallet1Address!;
+
+    const isTax = input.tokenType === 'tax';
+    const normalArgs = isTax
+      ? null
+      : ([input.tokenName!, input.tokenSymbol!, parseUnits(input.totalSupply!, 18)] as const);
+
+    const deployData = isTax
+      ? encodeDeployData({ abi: feeTokenAbi, bytecode: feeTokenBytecode, args: [] })
+      : encodeDeployData({ abi: launchTokenAbi, bytecode: launchTokenBytecode, args: normalArgs! });
+
+    let gasEstimate: bigint;
+    try {
+      gasEstimate = await publicClient.estimateGas({ account: wallet1Address, data: deployData });
+    } catch (error) {
+      throw new Error(`Token deploy simulation failed: ${describeError(error)}`);
+    }
+    const [gasPrice, balance] = await Promise.all([
+      publicClient.getGasPrice(),
+      publicClient.getBalance({ address: wallet1Address })
+    ]);
+    const required = gasWithBuffer(gasEstimate, 500_000n) * gasPrice;
+    if (balance < required) {
+      throw new Error(
+        `Wallet 1 needs ~${formatEther(required)} ETH for deploy gas; balance ${formatEther(balance)} ETH`
+      );
+    }
+
+    const deployHash = await this.sendTx(wallet1Account, (nonce) =>
+      isTax
+        ? wallet1.deployContract({
+            account: wallet1Account,
+            chain: BASE_CHAIN,
+            abi: feeTokenAbi,
+            bytecode: feeTokenBytecode,
+            args: [],
+            nonce
+          })
+        : wallet1.deployContract({
+            account: wallet1Account,
+            chain: BASE_CHAIN,
+            abi: launchTokenAbi,
+            bytecode: launchTokenBytecode,
+            args: normalArgs!,
+            nonce
+          })
+    );
+    const receipt = await publicClient.waitForTransactionReceipt({ hash: deployHash });
+    if (receipt.status !== 'success') {
+      throw new Error(receiptFailureMessage('Token deployment failed', receipt, deployHash));
+    }
+    const tokenAddress = receipt.contractAddress;
+    if (!tokenAddress) {
+      throw new Error('Token deployment did not return a contract address');
+    }
+
+    // Read the deployed name/symbol so the record shows the contract's real values — the tax
+    // contract hardcodes its own and ignores whatever the form says.
+    const readMeta = async (functionName: 'name' | 'symbol'): Promise<string | undefined> => {
+      try {
+        const value = await publicClient.readContract({ address: tokenAddress, abi: erc20Abi, functionName });
+        return typeof value === 'string' ? value : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const [onChainName, onChainSymbol] = await Promise.all([readMeta('name'), readMeta('symbol')]);
+
+    return this.deployRepository.create({
+      tokenType: input.tokenType,
+      tokenAddress: getAddress(tokenAddress),
+      tokenName: onChainName ?? input.tokenName,
+      tokenSymbol: onChainSymbol ?? input.tokenSymbol,
+      totalSupply: isTax ? undefined : input.totalSupply,
+      deployTxHash: deployHash,
+      deployerAddress: wallet1Address
+    });
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // Manual liquidity (dashboard "Liquidity" page). Runs on wallet 1 through the same nonce
+  // queue as the launch flow, so it is safe to use while a launch is mid-flight.
+  // ---------------------------------------------------------------------------------------
+
+  private async readTokenMeta(tokenAddress: Address): Promise<{ symbol?: string; decimals: number }> {
+    const publicClient = this.publicClient!;
+    const code = (await withRpcRetry(`token code for ${tokenAddress}`, () =>
+      publicClient.getBytecode({ address: tokenAddress })
+    )) as string | undefined;
+    if (!code || code === '0x') {
+      throw new Error(`No contract at ${tokenAddress} on ${BASE_CHAIN.name} (chain ${BASE_CHAIN.id})`);
+    }
+
+    const read = async (functionName: 'symbol' | 'decimals'): Promise<unknown> => {
+      try {
+        return await publicClient.readContract({ address: tokenAddress, abi: erc20Abi, functionName });
+      } catch {
+        return undefined;
+      }
+    };
+    const [decimals, symbol] = await Promise.all([read('decimals'), read('symbol')]);
+    if (decimals === undefined) {
+      throw new Error(`${tokenAddress} does not answer decimals() — it is not an ERC-20 token`);
+    }
+    return { decimals: Number(decimals), symbol: typeof symbol === 'string' ? symbol : undefined };
+  }
+
+  /** Wallet 1's LP balance for a pool plus its share of the reserves. Null when the pool has no code. */
+  private async readLpBalances(
+    adapter: DexAdapter,
+    poolAddress: Address,
+    tokenAddress: Address
+  ): Promise<{ lpBalance: bigint; pooledToken?: bigint; pooledEth?: bigint } | null> {
+    const publicClient = this.publicClient!;
+    const lpBalance = await this.readPoolLpBalance(publicClient, adapter, poolAddress, this.wallet1Address!);
+    if (lpBalance === null) return null;
+
+    try {
+      const [totalSupply, reserves, token0] = (await Promise.all([
+        publicClient.readContract({ address: poolAddress, abi: adapter.poolAbi, functionName: 'totalSupply' }),
+        publicClient.readContract({ address: poolAddress, abi: adapter.poolAbi, functionName: 'getReserves' }),
+        publicClient.readContract({ address: poolAddress, abi: adapter.poolAbi, functionName: 'token0' })
+      ])) as [bigint, readonly bigint[], Address];
+      if (totalSupply <= 0n) return { lpBalance };
+
+      const tokenIs0 = getAddress(token0) === getAddress(tokenAddress);
+      const tokenReserve = tokenIs0 ? reserves[0] : reserves[1];
+      const ethReserve = tokenIs0 ? reserves[1] : reserves[0];
+      return {
+        lpBalance,
+        pooledToken: (tokenReserve * lpBalance) / totalSupply,
+        pooledEth: (ethReserve * lpBalance) / totalSupply
+      };
+    } catch {
+      // Reserves are cosmetic — a pool that doesn't expose them still removes fine.
+      return { lpBalance };
+    }
+  }
+
+  private toLpPosition(
+    record: ManualLpRecord,
+    balances: { lpBalance: bigint; pooledToken?: bigint; pooledEth?: bigint }
+  ): LpPosition {
+    const decimals = record.tokenDecimals ?? 18;
+    return {
+      ...record,
+      lpBalance: balances.lpBalance.toString(),
+      pooledToken: balances.pooledToken === undefined ? undefined : formatUnits(balances.pooledToken, decimals),
+      pooledEth: balances.pooledEth === undefined ? undefined : formatEther(balances.pooledEth)
+    };
+  }
+
+  private async findPoolForToken(
+    tokenAddress: Address
+  ): Promise<{ adapter: DexAdapter; poolAddress: Address } | null> {
+    const publicClient = this.publicClient!;
+    for (const adapter of DEX_ADAPTERS) {
+      try {
+        const poolAddress = await this.readPoolAddress(publicClient, adapter, tokenAddress);
+        if (poolAddress) return { adapter, poolAddress };
+      } catch {
+        // The factory has no code on this chain (Aerodrome is Base-only) — it hosts no pool here.
+      }
+    }
+    return null;
+  }
+
+  private async approveToken(tokenAddress: Address, spender: Address, amount: bigint): Promise<`0x${string}`> {
+    const publicClient = this.publicClient!;
+    const wallet1 = this.wallet1!;
+    const wallet1Account = this.wallet1Account!;
+    const request = {
+      account: this.wallet1Address!,
+      address: tokenAddress,
+      abi: erc20Abi,
+      functionName: 'approve',
+      args: [spender, amount]
+    } as const;
+
+    const gas = await this.estimateWriteGas(publicClient, request, 80_000n);
+    const hash = await this.sendTx(wallet1Account, (nonce) =>
+      wallet1.writeContract({ ...request, account: wallet1Account, chain: BASE_CHAIN, gas, nonce })
+    );
+    const receipt = await publicClient.waitForTransactionReceipt({
+      hash,
+      timeout: REMOVE_RECEIPT_TIMEOUT_MS
+    });
+    if (receipt.status !== 'success') {
+      throw new Error(receiptFailureMessage('Token approval failed', receipt, hash));
+    }
+    return hash;
+  }
+
+  /** Saved manual LP positions that wallet 1 still holds. Rows whose LP is gone are dropped. */
+  async listSavedLp(): Promise<LpPosition[]> {
+    this.ensureClients();
+    const positions: LpPosition[] = [];
+
+    for (const record of this.lpRepository.list()) {
+      const adapter = getDexAdapter(record.dex);
+      const balances = await this.readLpBalances(
+        adapter,
+        getAddress(record.poolAddress),
+        getAddress(record.tokenAddress)
+      );
+      if (!balances) continue; // pool has no code on this chain — leave the row for a later scan
+      if (balances.lpBalance <= 0n) {
+        this.lpRepository.remove(record.poolAddress);
+        continue;
+      }
+      positions.push(this.toLpPosition(record, balances));
+    }
+
+    return positions;
+  }
+
+  /** Preview the LP wallet 1 holds for a token, so the UI can confirm before removing. */
+  async findLpByToken(rawTokenAddress: string): Promise<LpPosition | null> {
+    this.ensureClients();
+    const tokenAddress = getAddress(rawTokenAddress);
+    const { decimals, symbol } = await this.readTokenMeta(tokenAddress);
+
+    const found = await this.findPoolForToken(tokenAddress);
+    if (!found) return null;
+
+    const balances = await this.readLpBalances(found.adapter, found.poolAddress, tokenAddress);
+    if (!balances || balances.lpBalance <= 0n) return null;
+
+    const record = this.lpRepository.get(found.poolAddress) ?? {
+      poolAddress: found.poolAddress,
+      tokenAddress,
+      tokenSymbol: symbol,
+      tokenDecimals: decimals,
+      dex: found.adapter.key,
+      createdAt: nowIso(),
+      updatedAt: nowIso()
+    };
+    return this.toLpPosition(record, balances);
+  }
+
+  async addLiquidity(input: AddLiquidityInput): Promise<AddLiquidityResult> {
+    this.ensureClients();
+    const publicClient = this.publicClient!;
+    const wallet1 = this.wallet1!;
+    const wallet1Account = this.wallet1Account!;
+    const wallet1Address = this.wallet1Address!;
+    const adapter = getDexAdapter(DEFAULT_DEX);
+    const tokenAddress = getAddress(input.tokenAddress);
+
+    const { decimals, symbol } = await this.readTokenMeta(tokenAddress);
+    const unit = symbol || 'tokens';
+    const tokenAmount = parseUnits(input.tokenAmount, decimals);
+    const ethAmount = parseEther(input.ethAmount);
+    if (tokenAmount <= 0n) throw new Error('tokenAmount must be greater than 0');
+    if (ethAmount <= 0n) throw new Error('ethAmount must be greater than 0');
+
+    const [tokenBalance, ethBalance, gasPrice] = (await Promise.all([
+      publicClient.readContract({
+        address: tokenAddress,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [wallet1Address]
+      }),
+      publicClient.getBalance({ address: wallet1Address }),
+      publicClient.getGasPrice()
+    ])) as [bigint, bigint, bigint];
+
+    if (tokenBalance < tokenAmount) {
+      throw new Error(
+        `Wallet 1 holds ${formatUnits(tokenBalance, decimals)} ${unit}, needs ${input.tokenAmount}`
+      );
+    }
+    // Creating a new pair costs ~3M gas and the limit can be pre-charged in full on submission,
+    // so require liquidity + the whole gas reservation up front.
+    const requiredEth = ethAmount + (ADD_LIQUIDITY_GAS_FLOOR + 200_000n) * gasPrice;
+    if (ethBalance < requiredEth) {
+      throw new Error(
+        `Wallet 1 needs ~${formatEther(requiredEth)} ETH (${input.ethAmount} ETH liquidity + gas); ` +
+          `balance ${formatEther(ethBalance)} ETH`
+      );
+    }
+
+    // Fee tokens cap max-wallet/max-tx at a few percent of supply, which makes the router→pair
+    // transfer revert. Lift the caps when wallet 1 owns the token; a no-op for every other token.
+    await this.tryLiftTokenLimits(publicClient, wallet1, wallet1Account, wallet1Address, tokenAddress);
+
+    const allowance = (await publicClient.readContract({
+      address: tokenAddress,
+      abi: erc20Abi,
+      functionName: 'allowance',
+      args: [wallet1Address, adapter.router]
+    })) as bigint;
+    const approveTxHash =
+      allowance < tokenAmount ? await this.approveToken(tokenAddress, adapter.router, tokenAmount) : undefined;
+
+    const request = {
+      account: wallet1Address,
+      address: adapter.router,
+      abi: adapter.routerAbi,
+      functionName: 'addLiquidityETH',
+      // Zero minimums: a fee-on-transfer token delivers less than `tokenAmount` to the pair, and a
+      // non-zero minimum would make the router's exact-amount check revert.
+      args: adapter.addLiquidityEthArgs({
+        token: tokenAddress,
+        tokenAmount,
+        amountTokenMin: 0n,
+        amountEthMin: 0n,
+        to: wallet1Address,
+        deadline: deadline()
+      }),
+      value: ethAmount
+    };
+
+    // Simulate first so a revert surfaces its reason instead of silently burning gas on-chain.
+    try {
+      await publicClient.simulateContract(request);
+    } catch (error) {
+      throw new Error(`Add liquidity would revert: ${describeError(error)}`);
+    }
+
+    const gas = await this.estimateWriteGas(publicClient, request, ADD_LIQUIDITY_GAS_FLOOR);
+    const addTxHash = await this.sendTx(wallet1Account, (nonce) =>
+      wallet1.writeContract({ ...request, account: wallet1Account, chain: BASE_CHAIN, gas, nonce })
+    );
+    const receipt = await publicClient.waitForTransactionReceipt({
+      hash: addTxHash,
+      timeout: REMOVE_RECEIPT_TIMEOUT_MS
+    });
+    if (receipt.status !== 'success') {
+      throw new Error(receiptFailureMessage('Add liquidity transaction reverted', receipt, addTxHash));
+    }
+
+    const poolAddress = await this.resolvePoolAddress(publicClient, adapter, tokenAddress, receipt);
+    const record = this.lpRepository.upsert({
+      poolAddress,
+      tokenAddress,
+      tokenSymbol: symbol,
+      tokenDecimals: decimals,
+      dex: adapter.key,
+      addTxHash
+    });
+    const balances = (await this.readLpBalances(adapter, poolAddress, tokenAddress)) ?? { lpBalance: 0n };
+
+    return { position: this.toLpPosition(record, balances), approveTxHash, addTxHash };
+  }
+
+  async removeLiquidity(input: RemoveLiquidityInput): Promise<LpRemovalResult> {
+    this.ensureClients();
+    const publicClient = this.publicClient!;
+    const wallet1 = this.wallet1!;
+    const wallet1Account = this.wallet1Account!;
+    const wallet1Address = this.wallet1Address!;
+
+    let adapter: DexAdapter;
+    let poolAddress: Address;
+    let tokenAddress: Address;
+
+    if (input.poolAddress) {
+      poolAddress = getAddress(input.poolAddress);
+      const saved = this.lpRepository.get(poolAddress);
+      adapter = getDexAdapter(saved?.dex ?? DEFAULT_DEX);
+      tokenAddress = saved
+        ? getAddress(saved.tokenAddress)
+        : await this.resolveTokenFromPool(publicClient, adapter, poolAddress);
+    } else if (input.tokenAddress) {
+      tokenAddress = getAddress(input.tokenAddress);
+      await this.readTokenMeta(tokenAddress); // fail fast with "no contract" / "not an ERC-20"
+      const found = await this.findPoolForToken(tokenAddress);
+      if (!found) {
+        throw new Error(`No Uniswap V2 or Aerodrome pool found for ${tokenAddress}`);
+      }
+      ({ adapter, poolAddress } = found);
+    } else {
+      throw new Error('Provide a pool address or a token address');
+    }
+
+    const lpBalance = await this.readPoolLpBalance(publicClient, adapter, poolAddress, wallet1Address);
+    if (lpBalance !== null && lpBalance <= 0n) {
+      this.lpRepository.remove(poolAddress); // nothing left to remove — stop listing it
+    }
+    if (lpBalance === null || lpBalance <= 0n) {
+      throw new Error(`Wallet 1 holds no LP for pool ${poolAddress}`);
+    }
+
+    let txHash: `0x${string}` | null;
+    try {
+      txHash = await this.removePoolLiquidity(
+        publicClient,
+        adapter,
+        wallet1,
+        wallet1Account,
+        wallet1Address,
+        tokenAddress,
+        poolAddress
+      );
+    } catch (error) {
+      throw new Error(describeError(error));
+    }
+    if (!txHash) throw new Error(`Wallet 1 holds no LP for pool ${poolAddress}`);
+
+    this.lpRepository.remove(poolAddress);
+    for (const job of this.repository.markLpRemovedForPool(poolAddress, txHash)) {
+      this.broadcast?.(job, 'updated');
+    }
+
+    return { poolAddress, tokenAddress, txHash, success: true };
+  }
+
   private collectPoolCandidates(): Map<Address, PoolCandidateMeta> {
     const candidates = new Map<Address, PoolCandidateMeta>();
 
@@ -1491,9 +1940,10 @@ export class TokenLaunchService {
     const lpBalance = await this.readPoolLpBalance(publicClient, adapter, poolAddress, wallet1Address);
     if (lpBalance === null || lpBalance <= 0n) return null;
 
-    // Fee tokens cap max-wallet at ~2%, which makes the burn transfer to the router revert
-    // ("UniswapV2: TRANSFER_FAILED"). Lift the caps first (best-effort) so removal can proceed.
-    await this.tryLiftTokenLimits(publicClient, wallet1, wallet1Account, wallet1Address, tokenAddress);
+    // Hard precondition: while the fee token has limits enabled, the pair->router burn transfer
+    // reverts ("_transfer:: Trading is not active.") and the router masks it as
+    // "UniswapV2: TRANSFER_FAILED". Throws if the limits are on and cannot be lifted.
+    await this.liftTokenLimitsForRemoval(publicClient, wallet1, wallet1Account, wallet1Address, tokenAddress);
 
     if (adapter.supportsClaimFees) {
       await this.claimPoolFees(publicClient, adapter, wallet1, wallet1Account, wallet1Address, poolAddress);
@@ -1551,16 +2001,15 @@ export class TokenLaunchService {
       to: wallet1Address,
       deadline: deadline()
     });
-    // Try plain removeLiquidityETH first; a fee-on-transfer token (like the AS fee token) makes
-    // it revert because the pair->router burn transfer is taxed, leaving the router short of the
-    // exact amount it forwards. Fall back to the SupportingFeeOnTransferTokens variant, which
-    // forwards the router's actual received balance. Skip a candidate that fails simulation while
-    // a fallback remains, so we don't broadcast a guaranteed-revert (gas-wasting) transaction.
+    // Try plain removeLiquidityETH first; a fee-on-transfer token makes it revert because the
+    // pair->router burn transfer is taxed, leaving the router short of the exact amount it forwards.
+    // Fall back to the SupportingFeeOnTransferTokens variant, which forwards the router's actual
+    // received balance. EVERY candidate is simulated before broadcast — a router revert costs real
+    // gas and tells us nothing, so a candidate that cannot succeed is never sent.
     const removeCandidates = ['removeLiquidityETH', adapter.removeLiquiditySupportingFunctionName];
-    let lastError: unknown;
-    for (let i = 0; i < removeCandidates.length; i += 1) {
-      const functionName = removeCandidates[i];
-      const isLast = i === removeCandidates.length - 1;
+    const simulationFailures: string[] = [];
+
+    for (const functionName of removeCandidates) {
       const request = {
         account: wallet1Address,
         address: adapter.router,
@@ -1568,35 +2017,80 @@ export class TokenLaunchService {
         functionName,
         args: removeLiquidityArgs
       };
-      if (!isLast && !(await this.canSimulate(publicClient, request))) continue;
+
       try {
-        const removeGas = await this.estimateWriteGas(publicClient, request, 600_000n);
-        const removeHash = await this.sendTx(wallet1Account, (nonce) =>
-          wallet1.writeContract({
-            account: wallet1Account,
-            chain: BASE_CHAIN,
-            address: adapter.router,
-            abi: adapter.routerAbi,
-            functionName,
-            args: removeLiquidityArgs,
-            gas: removeGas,
-            nonce
-          })
-        );
-        const removeReceipt = await publicClient.waitForTransactionReceipt({
-          hash: removeHash,
-          timeout: REMOVE_RECEIPT_TIMEOUT_MS
-        });
-        if (removeReceipt.status !== 'success') {
-          throw new Error(receiptFailureMessage(`${functionName} failed`, removeReceipt, removeHash));
-        }
-        return removeHash;
+        await publicClient.simulateContract(request);
       } catch (error) {
-        lastError = error;
-        if (isLast) break;
+        simulationFailures.push(`${functionName}: ${describeError(error)}`);
+        continue;
       }
+
+      const removeGas = await this.estimateWriteGas(publicClient, request, 600_000n);
+      const removeHash = await this.sendTx(wallet1Account, (nonce) =>
+        wallet1.writeContract({ ...request, account: wallet1Account, chain: BASE_CHAIN, gas: removeGas, nonce })
+      );
+      const removeReceipt = await publicClient.waitForTransactionReceipt({
+        hash: removeHash,
+        timeout: REMOVE_RECEIPT_TIMEOUT_MS
+      });
+      if (removeReceipt.status !== 'success') {
+        // Simulated clean but reverted on-chain — state moved under us. Surface the real reason.
+        const reason = await this.explainRemoveRevert(publicClient, adapter, tokenAddress, poolAddress);
+        throw new Error(receiptFailureMessage(`${functionName} failed${reason ? ` — ${reason}` : ''}`, removeReceipt, removeHash));
+      }
+      return removeHash;
     }
-    throw lastError instanceof Error ? lastError : new Error('Remove liquidity transaction failed');
+
+    // Nothing could succeed and nothing was broadcast. Report every candidate's revert plus the
+    // token-level cause hiding behind the router's generic "TRANSFER_FAILED".
+    const reason = await this.explainRemoveRevert(publicClient, adapter, tokenAddress, poolAddress);
+    throw new Error(
+      `Remove liquidity would revert for pool ${poolAddress}` +
+        (reason ? ` — ${reason}` : '') +
+        ` · tried ${simulationFailures.join(' · ')}`
+    );
+  }
+
+  /**
+   * Explain a remove-liquidity revert in terms of the TOKEN, not the router.
+   *
+   * The router reports "UniswapV2: TRANSFER_FAILED" for any failed token transfer inside `burn()`,
+   * discarding the token's own revert data. Re-run that pair->router transfer standalone to recover
+   * the real `require` string, and add the actionable cause when we recognise it.
+   */
+  private async explainRemoveRevert(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    publicClient: any,
+    adapter: DexAdapter,
+    tokenAddress: Address,
+    poolAddress: Address
+  ): Promise<string | undefined> {
+    try {
+      const pairTokenBalance = (await publicClient.readContract({
+        address: tokenAddress,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [poolAddress]
+      })) as bigint;
+      if (pairTokenBalance <= 0n) return undefined;
+
+      const tokenRevert = await probeTokenTransferRevert(
+        publicClient,
+        tokenAddress,
+        poolAddress,
+        adapter.router,
+        pairTokenBalance
+      );
+      if (!tokenRevert) return undefined;
+
+      const limitsActive = await this.tokenLimitsActive(publicClient, tokenAddress);
+      const hint = limitsActive
+        ? ' (token still has limitsEnabled — call removeLimitsNow() from the token owner)'
+        : '';
+      return `the pair->router transfer reverts in the token: "${tokenRevert}"${hint}`;
+    } catch {
+      return undefined;
+    }
   }
 
   private async claimPoolFees(
@@ -1839,5 +2333,34 @@ export class TokenLaunchInputParser {
       throw new Error(`repeatCount must be at most ${MAX_REPEAT_COUNT}`);
     }
     return parsed;
+  }
+}
+
+const DEFAULT_MANUAL_SUPPLY = '1000000000';
+
+export class ManualDeployInputParser {
+  static parse(body: unknown): ManualTokenDeployInput {
+    const source = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+    const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+
+    const tokenType = str(source.tokenType).toLowerCase() as TokenDeployType;
+    if (tokenType !== 'normal' && tokenType !== 'tax') {
+      throw new Error("tokenType must be 'normal' or 'tax'");
+    }
+
+    // The tax contract hardcodes its own name/symbol/supply — nothing else to validate.
+    if (tokenType === 'tax') return { tokenType };
+
+    const tokenName = str(source.tokenName);
+    const tokenSymbol = str(source.tokenSymbol) || tokenName.slice(0, 8).toUpperCase();
+    const totalSupply = str(source.totalSupply) || DEFAULT_MANUAL_SUPPLY;
+    if (!tokenName) throw new Error('tokenName is required for a normal token');
+    if (!tokenSymbol) throw new Error('tokenSymbol is required for a normal token');
+    const supply = Number(totalSupply);
+    if (!Number.isFinite(supply) || supply <= 0) {
+      throw new Error('totalSupply must be a number greater than 0');
+    }
+
+    return { tokenType, tokenName, tokenSymbol, totalSupply };
   }
 }

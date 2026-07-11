@@ -76,6 +76,31 @@ function initTokenLaunchesSchema(db: AppDatabase): void {
     );
     CREATE INDEX IF NOT EXISTS idx_token_launches_created ON token_launches(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_token_launches_pool ON token_launches(pool_address);
+
+    CREATE TABLE IF NOT EXISTS manual_lp (
+      pool_address TEXT PRIMARY KEY,
+      token_address TEXT NOT NULL,
+      token_symbol TEXT,
+      token_decimals INTEGER,
+      dex TEXT NOT NULL,
+      add_tx_hash TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_manual_lp_created ON manual_lp(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS manual_deploys (
+      id TEXT PRIMARY KEY,
+      token_type TEXT NOT NULL,
+      token_address TEXT NOT NULL,
+      token_name TEXT,
+      token_symbol TEXT,
+      total_supply TEXT,
+      deploy_tx_hash TEXT NOT NULL,
+      deployer_address TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_manual_deploys_created ON manual_deploys(created_at DESC);
   `);
 }
 

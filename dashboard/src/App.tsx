@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, NavLink, Navigate, Route, Routes, useParams } from 'react-router-dom';
 import { GmailsPage } from './pages/GmailsPage';
+import { ManualLaunchPage } from './pages/ManualLaunchPage';
 import { OrdersPage } from './pages/OrdersPage';
 import { LaunchAnalyzerPage } from './pages/LaunchAnalyzerPage';
 import { TokenLaunchPage } from './pages/TokenLaunchPage';
@@ -43,7 +44,8 @@ function Header({ connected }: { connected: boolean }) {
           Extensions
         </NavLink>
         <NavLink to="/gmails">Gmails</NavLink>
-        <NavLink to="/tokenlaunch">Token Launch</NavLink>
+        <NavLink to="/auto-launch">Auto Launch</NavLink>
+        <NavLink to="/manual-launch">Manual Launch</NavLink>
         <NavLink to="/orders">Orders</NavLink>
       </nav>
       <span className={connected ? 'pill success' : 'pill muted'}>
@@ -533,15 +535,19 @@ function App() {
         />
         <Route path="/gmails" element={<GmailsPage />} />
         <Route
-          path="/tokenlaunch"
+          path="/auto-launch"
           element={<TokenLaunchPage jobs={tokenLaunches} reloadJobs={reloadTokenLaunches} />}
         />
+        <Route path="/manual-launch" element={<ManualLaunchPage />} />
         <Route
           path="/workflow"
           element={
             <WorkflowPage extensions={extensions} workflows={workflows} reloadWorkflows={reloadWorkflows} />
           }
         />
+        {/* Old bookmarks — the pages moved under the auto/manual split. */}
+        <Route path="/tokenlaunch" element={<Navigate to="/auto-launch" replace />} />
+        <Route path="/liquidity" element={<Navigate to="/manual-launch" replace />} />
         <Route path="/tokenlaunch/:jobId" element={<LaunchAnalyzerPage />} />
         <Route
           path="/orders"

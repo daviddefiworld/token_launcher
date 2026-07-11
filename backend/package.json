@@ -5,6 +5,7 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "compile:tokens": "node scripts/compile-tokens.js",
     "build": "tsc && node -e \"const fs=require('fs');const path=require('path');const src=path.join('src','skills','tokenlaunch','compiled');const dst=path.join('dist','skills','tokenlaunch','compiled');if(fs.existsSync(src)){fs.mkdirSync(path.dirname(dst),{recursive:true});fs.cpSync(src,dst,{recursive:true});}\"",
     "start": "node dist/index.js"
   },
@@ -20,6 +21,8 @@
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/node": "^22.19.19",
+    "solc": "0.8.25",
+    "solc0819": "npm:solc@0.8.19",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.9.3"
   }

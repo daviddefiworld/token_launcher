@@ -262,6 +262,25 @@ export const aerodromePoolAbi = [
     stateMutability: 'view',
     inputs: [{ name: 'account', type: 'address' }],
     outputs: [{ type: 'uint256' }]
+  },
+  {
+    type: 'function',
+    name: 'totalSupply',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ type: 'uint256' }]
+  },
+  {
+    // Solidly pools return full-width uint256 reserves (Uniswap V2 packs them into uint112).
+    type: 'function',
+    name: 'getReserves',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [
+      { name: '_reserve0', type: 'uint256' },
+      { name: '_reserve1', type: 'uint256' },
+      { name: '_blockTimestampLast', type: 'uint256' }
+    ]
   }
 ] as const;
 
@@ -430,5 +449,23 @@ export const uniswapPoolAbi = [
       { name: 'spender', type: 'address' }
     ],
     outputs: [{ type: 'uint256' }]
+  },
+  {
+    type: 'function',
+    name: 'totalSupply',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ type: 'uint256' }]
+  },
+  {
+    type: 'function',
+    name: 'getReserves',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [
+      { name: '_reserve0', type: 'uint112' },
+      { name: '_reserve1', type: 'uint112' },
+      { name: '_blockTimestampLast', type: 'uint32' }
+    ]
   }
 ] as const;

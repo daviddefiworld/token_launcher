@@ -3,11 +3,14 @@ import { getOrdersDb, getTokenLaunchesDb, getWorkflowsDb, getVerificationDb, get
 import type {
   AutomationOrder,
   CachedGmailMessage,
+  DeployedTokenRecord,
+  DexKey,
   GmailAccount,
   LaunchWorkflow,
   LaunchWorkflowInput,
   LaunchWorkflowRecord,
   LaunchWorkflowStatus,
+  ManualLpRecord,
   StoredWorkflowWallet,
   TokenLaunchJob,
   TokenLaunchInput,
@@ -576,6 +579,171 @@ export class TokenLaunchRepository {
       updated.push(next);
     }
     return updated;
+  }
+}
+
+type ManualLpRow = {
+  pool_address: string;
+  token_address: string;
+  token_symbol: string | null;
+  token_decimals: number | null;
+  dex: string;
+  add_tx_hash: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+function rowToManualLp(row: ManualLpRow): ManualLpRecord {
+  return {
+    poolAddress: row.pool_address,
+    tokenAddress: row.token_address,
+    tokenSymbol: row.token_symbol ?? undefined,
+    tokenDecimals: row.token_decimals ?? undefined,
+    dex: row.dex as DexKey,
+    addTxHash: row.add_tx_hash ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+/**
+ * LP positions created from the manual liquidity page. A row exists only while wallet 1 still
+ * holds LP for the pool — the service deletes it once the balance hits zero, so the saved list
+ * always reflects removable positions.
+ */
+export class ManualLpRepository {
+  private readonly insertStmt;
+  private readonly updateStmt;
+  private readonly getStmt;
+  private readonly listStmt;
+  private readonly deleteStmt;
+
+  constructor(db: AppDatabase = getTokenLaunchesDb()) {
+    this.insertStmt = db.prepare(`
+      INSERT INTO manual_lp (
+        pool_address, token_address, token_symbol, token_decimals, dex, add_tx_hash,
+        created_at, updated_at
+      ) VALUES (
+        @poolAddress, @tokenAddress, @tokenSymbol, @tokenDecimals, @dex, @addTxHash,
+        @createdAt, @updatedAt
+      )
+    `);
+    this.updateStmt = db.prepare(`
+      UPDATE manual_lp SET
+        token_address = @tokenAddress,
+        token_symbol = @tokenSymbol,
+        token_decimals = @tokenDecimals,
+        dex = @dex,
+        add_tx_hash = @addTxHash,
+        updated_at = @updatedAt
+      WHERE lower(pool_address) = lower(@poolAddress)
+    `);
+    this.getStmt = db.prepare('SELECT * FROM manual_lp WHERE lower(pool_address) = lower(?)');
+    this.listStmt = db.prepare('SELECT * FROM manual_lp ORDER BY created_at DESC');
+    this.deleteStmt = db.prepare('DELETE FROM manual_lp WHERE lower(pool_address) = lower(?)');
+  }
+
+  list(): ManualLpRecord[] {
+    return (this.listStmt.all() as ManualLpRow[]).map(rowToManualLp);
+  }
+
+  get(poolAddress: string): ManualLpRecord | undefined {
+    const row = this.getStmt.get(poolAddress) as ManualLpRow | undefined;
+    return row ? rowToManualLp(row) : undefined;
+  }
+
+  upsert(input: Omit<ManualLpRecord, 'createdAt' | 'updatedAt'>): ManualLpRecord {
+    const existing = this.get(input.poolAddress);
+    const record: ManualLpRecord = {
+      ...input,
+      createdAt: existing?.createdAt ?? nowIso(),
+      updatedAt: nowIso()
+    };
+    const row = {
+      poolAddress: record.poolAddress,
+      tokenAddress: record.tokenAddress,
+      tokenSymbol: record.tokenSymbol ?? null,
+      tokenDecimals: record.tokenDecimals ?? null,
+      dex: record.dex,
+      addTxHash: record.addTxHash ?? null,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt
+    };
+    if (existing) {
+      this.updateStmt.run(row);
+    } else {
+      this.insertStmt.run(row);
+    }
+    return record;
+  }
+
+  remove(poolAddress: string): void {
+    this.deleteStmt.run(poolAddress);
+  }
+}
+
+type ManualDeployRow = {
+  id: string;
+  token_type: string;
+  token_address: string;
+  token_name: string | null;
+  token_symbol: string | null;
+  total_supply: string | null;
+  deploy_tx_hash: string;
+  deployer_address: string;
+  created_at: string;
+};
+
+function rowToManualDeploy(row: ManualDeployRow): DeployedTokenRecord {
+  return {
+    id: row.id,
+    tokenType: row.token_type as DeployedTokenRecord['tokenType'],
+    tokenAddress: row.token_address,
+    tokenName: row.token_name ?? undefined,
+    tokenSymbol: row.token_symbol ?? undefined,
+    totalSupply: row.total_supply ?? undefined,
+    deployTxHash: row.deploy_tx_hash,
+    deployerAddress: row.deployer_address,
+    createdAt: row.created_at
+  };
+}
+
+/** Tokens deployed from the manual launch page (deploy only). Append-only history. */
+export class ManualDeployRepository {
+  private readonly insertStmt;
+  private readonly listStmt;
+
+  constructor(db: AppDatabase = getTokenLaunchesDb()) {
+    this.insertStmt = db.prepare(`
+      INSERT INTO manual_deploys (
+        id, token_type, token_address, token_name, token_symbol, total_supply,
+        deploy_tx_hash, deployer_address, created_at
+      ) VALUES (
+        @id, @tokenType, @tokenAddress, @tokenName, @tokenSymbol, @totalSupply,
+        @deployTxHash, @deployerAddress, @createdAt
+      )
+    `);
+    this.listStmt = db.prepare('SELECT * FROM manual_deploys ORDER BY created_at DESC');
+  }
+
+  list(): DeployedTokenRecord[] {
+    return (this.listStmt.all() as ManualDeployRow[]).map(rowToManualDeploy);
+  }
+
+  create(input: Omit<DeployedTokenRecord, 'id' | 'createdAt'>): DeployedTokenRecord {
+    const record: DeployedTokenRecord = { ...input, id: randomUUID(), createdAt: nowIso() };
+    this.insertStmt.run({
+      id: record.id,
+      tokenType: record.tokenType,
+      tokenAddress: record.tokenAddress,
+      tokenName: record.tokenName ?? null,
+      tokenSymbol: record.tokenSymbol ?? null,
+      totalSupply: record.totalSupply ?? null,
+      deployTxHash: record.deployTxHash,
+      deployerAddress: record.deployerAddress,
+      createdAt: record.createdAt
+    });
+    return record;
   }
 }
 

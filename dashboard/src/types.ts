@@ -173,6 +173,57 @@ export interface LpRemovalResult {
   error?: string;
 }
 
+export interface LpPosition {
+  poolAddress: string;
+  tokenAddress: string;
+  tokenSymbol?: string;
+  tokenDecimals?: number;
+  dex: DexKey;
+  addTxHash?: string;
+  createdAt: string;
+  updatedAt: string;
+  /** Wallet 1's raw LP-token balance for the pool. */
+  lpBalance: string;
+  /** Wallet 1's share of the pool reserves, in human units. */
+  pooledToken?: string;
+  pooledEth?: string;
+}
+
+export interface AddLiquidityInput {
+  tokenAddress: string;
+  tokenAmount: string;
+  ethAmount: string;
+}
+
+/** 'normal' = plain ERC-20 with name/symbol/supply; 'tax' = compiled fee-on-transfer contract. */
+export type TokenDeployType = 'normal' | 'tax';
+
+export interface ManualTokenDeployInput {
+  tokenType: TokenDeployType;
+  tokenName?: string;
+  tokenSymbol?: string;
+  /** Human units (18 decimals applied on chain). Normal token only. */
+  totalSupply?: string;
+}
+
+export interface DeployedToken {
+  id: string;
+  tokenType: TokenDeployType;
+  tokenAddress: string;
+  tokenName?: string;
+  tokenSymbol?: string;
+  totalSupply?: string;
+  deployTxHash: string;
+  deployerAddress: string;
+  createdAt: string;
+}
+
+export interface AddLiquidityResult {
+  position: LpPosition;
+  approveTxHash?: string;
+  addTxHash: string;
+}
+
 export interface TokenLaunchStatusResponse {
   configured: boolean;
   wallet1Address?: string;

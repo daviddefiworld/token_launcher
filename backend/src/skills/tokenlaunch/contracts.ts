@@ -30,10 +30,21 @@ export const launchTokenAbi = [
 ] as const;
 
 /**
- * The `AS` fee-on-transfer token (feeToken.sol). Constructor takes NO arguments — name,
- * symbol (Asteroid Shiba / ASTEROID), 9 decimals and the total supply are hardcoded, and
- * the constructor itself creates the Uniswap V2 pair. All supply is minted to the deployer,
- * who is tax-exempt, so wallet 1 can add liquidity normally (no `enableTrading()` needed).
+ * The fee-on-transfer token (tokens/Mystery.sol — "Mystery" / MYSTERY, 18 decimals, 1B supply,
+ * 2% buy + 2% sell tax). Constructor takes NO arguments and itself creates the Uniswap V2 pair.
+ * All supply is minted to the deployer, who is both tax- and limit-exempt, so wallet 1 can add
+ * liquidity normally.
+ *
+ * IMPORTANT — the token launches LOCKED. `limitsEnabled` is true and `tradingEnabled` is false,
+ * and `_transfer` reverts with "_transfer:: Trading is not active." for any transfer between two
+ * non-exempt, non-owner addresses. That covers the pair->router leg of an LP removal and every
+ * external buy, which the router masks as "UniswapV2: TRANSFER_FAILED".
+ *
+ * `openTrading()` cannot unlock it: it requires `msg.sender == addop`, and `addop` is never set
+ * (zero address). The only usable unlock is the owner-only `removeLimitsNow()`, which sets
+ * `limitsEnabled = false` — that skips the whole limits block in `_transfer`, including the
+ * trading-active require and the max-wallet/max-tx caps. Hence `removeLimitsNow()` is what gates
+ * both buying and LP removal, and it must be called after adding liquidity.
  */
 export const feeTokenAbi = [
   { type: 'constructor', inputs: [] },
@@ -63,16 +74,29 @@ export const feeTokenAbi = [
   },
   {
     type: 'function',
-    name: '_maxWalletSize',
+    name: 'owner',
     stateMutability: 'view',
     inputs: [],
-    outputs: [{ type: 'uint256' }]
+    outputs: [{ type: 'address' }]
   },
   {
-    // onlyOwner: raises max tx / max wallet to the full supply, i.e. removes the 2% limits
-    // that otherwise revert any non-trivial buy ("Exceeds the _maxTxAmount.").
+    // `_limitsEnabled` is the master switch: while true, non-exempt transfers are blocked
+    // (trading not active) and capped by maxWallet/maxTx.
     type: 'function',
-    name: 'isNotRestricted',
+    name: 'readLimitsInfo',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [
+      { name: '_limitsEnabled', type: 'bool' },
+      { name: '_maxWallet', type: 'uint256' },
+      { name: '_maxTx', type: 'uint256' }
+    ]
+  },
+  {
+    // onlyOwner: sets limitsEnabled = false, which unblocks buys AND the pair->router burn
+    // transfer during LP removal. This is the token's only working unlock (see note above).
+    type: 'function',
+    name: 'removeLimitsNow',
     stateMutability: 'nonpayable',
     inputs: [],
     outputs: []
@@ -103,8 +127,8 @@ function loadBytecode(fileName: string, label: string): `0x${string}` {
 }
 
 export const launchTokenBytecode = loadBytecode(
-  'src_skills_tokenlaunch_LaunchToken_sol_LaunchToken.bin',
+  'LaunchToken_sol_LaunchToken.bin',
   'LaunchToken'
 );
 
-export const feeTokenBytecode = loadBytecode('feeToken_sol_AS.bin', 'feeToken (AS)');
+export const feeTokenBytecode = loadBytecode('Mystery_sol_Mystery.bin', 'feeToken (Mystery)');

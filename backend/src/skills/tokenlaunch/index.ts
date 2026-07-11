@@ -1,4 +1,4 @@
-export { TokenLaunchService, TokenLaunchInputParser } from './service';
+export { TokenLaunchService, TokenLaunchInputParser, ManualDeployInputParser } from './service';
 export {
   DEFAULT_LP_ETH,
   DEFAULT_BUY_ETH,

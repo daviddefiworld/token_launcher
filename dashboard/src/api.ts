@@ -1,12 +1,17 @@
 import type {
   ActivityItem,
+  AddLiquidityInput,
+  AddLiquidityResult,
   AutomationOrder,
   CachedGmailMessage,
+  DeployedToken,
   ExtensionRecord,
   GmailAccount,
   GmailStatus,
   LaunchWorkflow,
   LaunchWorkflowInput,
+  LpPosition,
+  ManualTokenDeployInput,
   TokenLaunchInput,
   TokenLaunchJob,
   TokenLaunchStatusResponse,
@@ -16,7 +21,7 @@ import type {
   LpRemovalResult
 } from './types';
 
-export type { TokenLaunchInput, LaunchWorkflowInput };
+export type { TokenLaunchInput, LaunchWorkflowInput, AddLiquidityInput, ManualTokenDeployInput };
 
 export interface WithdrawOrderInput {
   currency: string;
@@ -130,6 +135,39 @@ class BackendClient {
     });
   }
 
+  getDeployedTokens(): Promise<DeployedToken[]> {
+    return this.readJson('/api/deploy');
+  }
+
+  deployToken(input: ManualTokenDeployInput): Promise<DeployedToken> {
+    return this.readJson('/api/deploy', {
+      method: 'POST',
+      body: JSON.stringify(input)
+    });
+  }
+
+  getLpPositions(): Promise<LpPosition[]> {
+    return this.readJson('/api/liquidity');
+  }
+
+  lookupLpPosition(tokenAddress: string): Promise<LpPosition | null> {
+    return this.readJson(`/api/liquidity/lookup?tokenAddress=${encodeURIComponent(tokenAddress)}`);
+  }
+
+  addLiquidity(input: AddLiquidityInput): Promise<AddLiquidityResult> {
+    return this.readJson('/api/liquidity/add', {
+      method: 'POST',
+      body: JSON.stringify(input)
+    });
+  }
+
+  removeLiquidity(input: { poolAddress: string } | { tokenAddress: string }): Promise<LpRemovalResult> {
+    return this.readJson('/api/liquidity/remove', {
+      method: 'POST',
+      body: JSON.stringify(input)
+    });
+  }
+
   getLaunchWorkflows(): Promise<LaunchWorkflow[]> {
     return this.readJson('/api/workflows');
   }
@@ -223,6 +261,13 @@ export const finishTokenLaunch = (jobId: string) => client.finishTokenLaunch(job
 export const getUnremovedLp = () => client.getUnremovedLp();
 export const removeUnremovedLp = (input: { poolAddress: string } | { all: true }) =>
   client.removeUnremovedLp(input);
+export const getDeployedTokens = () => client.getDeployedTokens();
+export const deployToken = (input: ManualTokenDeployInput) => client.deployToken(input);
+export const getLpPositions = () => client.getLpPositions();
+export const lookupLpPosition = (tokenAddress: string) => client.lookupLpPosition(tokenAddress);
+export const addLiquidity = (input: AddLiquidityInput) => client.addLiquidity(input);
+export const removeLiquidity = (input: { poolAddress: string } | { tokenAddress: string }) =>
+  client.removeLiquidity(input);
 export const getLaunchWorkflows = () => client.getLaunchWorkflows();
 export const getLaunchWorkflow = (workflowId: string) => client.getLaunchWorkflow(workflowId);
 export const startLaunchWorkflow = (input: LaunchWorkflowInput) => client.startLaunchWorkflow(input);
